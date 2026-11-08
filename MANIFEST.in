@@ -1,0 +1,21 @@
+include LICENSE
+include LICENSING.md
+include THIRD_PARTY_NOTICES.md
+include README.md
+include THIRD_PARTY_LICENSES/MIT-Albumentations-2.0.8.txt
+
+exclude CLA.md
+prune legal
+
+prune docs/_build
+global-exclude docs/augs_overview/*/images/*.jpg
+
+global-exclude *.py[co] .DS_Store
+
+# Exclude test, tools, and benchmark directories
+prune tests
+prune tools
+prune benchmark
+prune conda.recipe
+prune pre-commit-config.yaml
+prune .github

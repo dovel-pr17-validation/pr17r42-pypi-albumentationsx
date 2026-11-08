@@ -1,0 +1,229 @@
+# Generated Transform Target Contracts
+
+**Status:** Implemented
+**Scope:** public `DualTransform` execution plus Tensor routing for `ImageOnlyTransform` targets
+**Primary readers:** maintainers adding transform modes, targets, metadata requirements, or target-specific behavior
+
+## Declaration and execution are one contract
+
+For every concrete public transform, its `Targets:` docstring, effective `_targets`, and active dispatch keys must
+name the same targets. `BasicTransform` builds the dispatch table from `_targets` alone and resolves the selected
+`apply*` handler through the class hierarchy, so a working inherited handler counts. A missing handler or inherited
+stub does not implement a target. `images`, `masks`, `volumes`, and `masks3d` are explicit collection targets; they do
+not follow from `image`, `mask`, `volume`, or `mask3d`. Their base handlers reuse the existing single-item route with
+the same sampled parameters for every collection item. The built-in `user_data` passthrough is not an active target;
+a transform may opt in with an explicit declaration and its own handler. `Compose` accepts this passthrough field with `strict=True`.
+
+`Targets:` must be a section header on its own line, with the target list indented below it.
+`tests/test_docstrings.py` reads this section from `albu-spec`'s parsed docstring and compares it with `_targets`;
+`tests/test_targets.py` checks that dispatch keys match the declaration and do not resolve to base-class stubs.
+The generated target cluster then executes each selected target through the public `Compose` route.
+
+## What adding a registry case now covers
+
+Every registered `DualTransform` mode automatically runs against each applicable core target profile. A new constructor
+mode therefore receives image/mask, horizontal bounding box (HBB), oriented bounding box (OBB), keypoint, and
+volume/`mask3d` coverage without another transform list.
+One primary mode per class also runs against the more expensive dtype, channel, batch, empty-target, memory-layout, and
+read-only profiles.
+
+Every primary `ImageOnlyTransform` mode automatically runs through the Tensor bridge for `image`, batched `images`,
+`volume`, and batched `volumes`. These profiles check `CHW`, `NCHW`, `CDHW`, and `NCDHW` Tensor layouts without adding
+annotation targets that an image-only transform does not declare.
+
+Every primary mode also runs through `tests/contracts/test_transform_lifetime.py` with default and explicit invocation
+seeds. The pipeline remains alive across calls; all per-call input and result arrays must be released by reference
+counting after the caller discards them. The test shares the existing registry and adds no transform-name exceptions.
+
+The generated matrix answers three questions:
+
+| Matrix | Cases | Profiles | Property under test |
+|---|---|---|---|
+| Core | Every registered `DualTransform` mode | Applicable core profiles | A public mode executes every declared target and preserves target structure |
+| Extended | One explicit primary `DualTransform` mode per class | Applicable extended profiles | Mode-independent dtype, channel, batch, empty-target, and memory contracts hold |
+| Tensor | Every core pair plus selected extended pairs; one primary ImageOnly mode per class | Equivalent plain CPU Tensor targets | Container, layout, dtype, values, replay parity, and input ownership match the NumPy case |
+
+Running every mode through the core profiles closes the gap that allowed a new mutually exclusive constructor mode to
+miss bbox, keypoint, or volume tests. Restricting extended profiles to primary modes controls runtime because these
+workloads test array representation rather than constructor branching.
+
+The Tensor matrix reuses the same case inventory, applicability decisions, and `targets_as_params` metadata. It uses
+dedicated image-only target profiles because those transforms do not declare annotation targets; it adds no second
+transform inventory.
+
+## Numerical comparisons
+
+Input ownership, metadata, categorical masks, annotations and same-container replay remain exact. The final
+NumPy-versus-Tensor image comparison is exact by default. A case may declare `tensor_uint8_atol` for uint8 image or
+volume results; this never applies to float16/float32, masks, input snapshots or replay checks.
+
+Anisotropy3D declares two uint8 levels because its downsample/restore path contains two linear resizes, each with a
+one-level rounding allowance. NumPy and Tensor retain their released sampling policies. A literal regression vector
+captured with published Albucore 0.3.1 checks each container bitwise, independently of this cross-container allowance.
+
+## One configuration inventory, reusable target workloads
+
+`tests/helpers/transform_cases.py` is the only shared transform/kwargs inventory. A `TransformContractCase` owns:
+
+- a stable `case_id` and public constructor kwargs;
+- the primary data and `Compose` settings used by constructor serialization and applied-configuration replay;
+- a context factory for transform-required metadata such as reference images or donor records;
+- target prerequisites such as a non-empty mask or bbox set;
+- replay strength and deterministic seeds;
+- an explicit uint8 cross-container rounding allowance, which defaults to zero.
+
+`tests/helpers/target_profiles.py` owns input workloads and output assertions. Profiles contain no transform classes and
+no transform kwargs. This separation lets one new profile cover the complete applicable registry and lets one new mode
+inherit the complete core target matrix.
+
+Input assembly and execution follow one visible path:
+
+```mermaid
+flowchart LR
+    P["Target profile factory"] --> D["Fresh standard targets"]
+    C["Case context factory"] --> M["Collision-checked merge"]
+    D --> M
+    M --> A["Public Compose call"]
+    A --> R["Structural assertions and replay boundaries"]
+```
+
+A collision is a registry error. Context never silently replaces a profile target.
+
+## Core profiles exercise synchronized targets
+
+Core fixtures use non-square `96×128` spatial dimensions. Images encode row and column coordinates, masks contain
+several asymmetric class regions, and annotations carry multiple aligned label fields.
+
+| Profile ID | Public targets | Main assertions |
+|---|---|---|
+| `image-mask` | `image`, `mask` | Spatial shape, dtype, and mask synchronization |
+| `hbb-labels` | image, mask, HBBs, two label fields | Finite normalized boxes and row-aligned fields |
+| `obb-labels` | image, mask, OBBs, two label fields | Finite normalized geometry, angle column, and aligned fields |
+| `keypoints-labels` | image, mask, keypoints, labels | Finite keypoints and aligned labels |
+| `volume-mask3d` | `volume`, `mask3d` | Slice/depth behavior, spatial synchronization, and dtype |
+
+The HBB and OBB profiles use separate `BboxParams`. A case collects only for bbox types declared in
+`_supported_bbox_types`.
+
+## Extended profiles cover representation hazards
+
+Extended profiles run one primary mode per class:
+
+- float32, one-channel, and five-channel image/mask data;
+- `images` and `masks` batches;
+- `volumes` and `masks3d` collections, checking lengths, spatial synchronization, channel layout, and dtype;
+- empty HBB and keypoint collections;
+- non-contiguous image/mask views; and
+- read-only image/mask arrays.
+
+The channel profiles use the optional `_supported_channel_counts` capability. Transforms with a real channel-count
+restriction declare it on the transform class, so the resolver remains free of transform-name branches.
+
+The Tensor matrix also runs the float32, one-channel, five-channel, `images`, `masks`, `volumes`/`masks3d`, and
+non-contiguous extended profiles. The read-only profile remains NumPy-only because `torch.from_numpy()` cannot provide
+a writable Tensor backed by a read-only array.
+
+## Applicability comes from public behavior
+
+`tests/helpers/target_contracts.py` creates a pair only when all of these conditions hold:
+
+1. the case class is a `DualTransform`, or an `ImageOnlyTransform` for the dedicated Tensor profiles;
+2. the profile contains every target required by the case;
+3. a required target is non-empty when the mode needs data from it;
+4. the transform's declared `_targets` contain every profile target exactly as supplied, including `images`, `masks`,
+   `volumes`, and `masks3d` when those collection routes are supported;
+5. the requested bbox type is declared; and
+6. the profile channel count is supported when the transform declares a restriction.
+
+The resolver selects pairs from capabilities. A missing declared capability prevents collection. A collected pair that
+cannot execute fails with its case ID and profile ID.
+
+Meta-tests enforce that pair IDs are unique, every registered `DualTransform` case has core coverage, every primary
+`ImageOnlyTransform` case has Tensor coverage for image, image batch, volume, and volume batch, and every general target
+profile collects at least once.
+Performance pressure is handled by the core/extended tier boundary; applicable core pairs are never sampled or skipped.
+
+## Every pair crosses the same public boundaries
+
+The runner constructs `Compose` with `p=1`, `strict=True`, `save_applied_params=True`, and seed `137` unless the case
+declares another seed. It then performs this sequence:
+
+1. build fresh profile targets and case context;
+2. execute the public `Compose` call;
+3. verify that caller-owned inputs remain unchanged;
+4. run the profile's structural and synchronization assertions;
+5. transport `applied_transforms` through strict JSON;
+6. reconstruct with `Compose.from_applied_transforms()` and execute on fresh equivalent input;
+7. compare every input target, label field, and context value exactly for `ReplayProfile.EXACT` cases; and
+8. run a separate `ReplayCompose` capture/replay and compare the complete input payload exactly.
+
+Applied-configuration replay and `ReplayCompose` preserve different state. The first records a runnable realized
+constructor policy. The second records parameters from one invocation. Both boundaries stay in the runner so target
+support cannot pass by exercising only one persistence API.
+
+`tests/helpers/contract_assertions.py` supplies the shared recursive equality and mutation diagnostics used by target,
+applied-configuration, and constructor-serialization tests.
+
+For the Tensor matrix, the runner first captures a NumPy `ReplayCompose` result. It replays the same parameters with
+equivalent Tensor targets, restores Tensor results to logical NumPy layouts, and compares every source key. Tensor
+bboxes and keypoints are compared as `float32`, which is their public Tensor dtype.
+
+## Specialized tests keep precise semantics
+
+Generated profiles own broad execution, synchronization, replay, dtype, layout, and batch responsibilities. A focused
+test remains when it has a stronger oracle, such as:
+
+- exact crop coordinates or OBB refitting geometry;
+- exact interpolation label values;
+- deterministic sampling and distribution properties;
+- zero-size prevention; or
+- empty-depth and empty-batch representation regressions.
+
+Do not retain a focused test whose only assertions are “the transform did not raise,” “the target key exists,” or “the
+annotation has the expected column count.” The generated cluster already checks those properties across every
+applicable mode.
+
+## Contributor workflow
+
+When adding or changing a transform mode:
+
+1. add one named case to `tests/helpers/transform_cases.py`;
+2. declare every target, bbox type, and genuine channel-count restriction on the transform;
+3. set `required_targets` when parameter sampling needs a non-empty mask or bbox collection;
+4. add a context factory when the transform consumes metadata outside the standard targets;
+5. run the collection meta-tests and inspect the new `case-id--profile-id` pairs;
+6. add a profile only when the array/annotation workload should apply to a cluster of transforms; and
+7. add focused tests only for exact transform semantics that shared assertions cannot express.
+
+Use these commands for fast feedback:
+
+```bash
+uv run pytest -q tests/contracts/test_target_cluster_contract.py -W error::RuntimeWarning
+uv run pytest -n auto -q tests/contracts/test_target_cluster_contract.py
+uv run pytest -q tests/contracts tests/test_serialization.py
+pre-commit run --all-files --show-diff-on-failure
+```
+
+## Completion invariants
+
+The architecture remains complete while:
+
+- adding one registered mode automatically creates all applicable core pairs;
+- adding one registered `ImageOnlyTransform` mode automatically creates Tensor pairs for image, image batches, volume,
+  and volume batches;
+- target profiles contain no transform class lists or constructor kwargs;
+- core selection uses declared capabilities and has no class-name skip branches;
+- all-mode and primary-mode views are explicit at each consumer;
+- every invocation uses fresh deterministic data and checks caller-input mutation;
+- strict JSON applied replay and exact `ReplayCompose` replay both execute;
+- specialized tests state a stronger semantic property than the generated cluster; and
+- the contract suite passes under `pytest-xdist` without shared mutable state.
+
+## References
+
+- `tests/helpers/transform_cases.py`: canonical public constructor modes
+- `tests/helpers/contract_data.py`: fresh target and context factories
+- `tests/helpers/target_profiles.py`: reusable workloads and assertions
+- `tests/helpers/target_contracts.py`: capability resolver, pair generation, and runner
+- `tests/contracts/test_target_cluster_contract.py`: generated matrix and completeness checks
+- `docs/design/applied-config-replay-contracts.md`: persistence boundaries and replay strength

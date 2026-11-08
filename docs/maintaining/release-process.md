@@ -1,0 +1,224 @@
+# Release Process
+
+AlbumentationsX validates and builds a release when a pull request increases
+`project.version`. Publishing GitHub Release notes then delivers that verified
+bundle to the GitHub Release and PyPI.
+
+## Normal Release Path
+
+The maintainer performs three actions:
+
+1. Increase `project.version` in `pyproject.toml`, refresh `uv.lock` with
+   `uv lock`, and open a pull request.
+2. Merge the pull request after the stable required checks and release preflight
+   pass. The **Pin release tag** workflow creates the version tag on that PR's
+   merge commit once its PR workflow has completed successfully.
+3. Select that existing tag, prepare the GitHub Release notes, and select
+   **Publish release**.
+
+Include the applicable [unreleased notes](../release-notes/unreleased.md), especially
+custom-transform migration requirements, when preparing the release text.
+
+Later merges into `main` do not change the release tag or its verified bundle.
+No draft release, Release Candidate run, artifact ID, or manual promotion
+approval is required.
+
+## The Version-Bump PR Is the Release Gate
+
+`tools.ci_plan` reads `project.version` from the base and head revisions and
+compares them as PEP 440 versions. A version increase selects `Release
+preflight`; a version bump that also changes package metadata or dependencies
+selects the conservative routed PR profile. A decrease or invalid version
+blocks the PR plan with an explicit error.
+
+The normal stable PR gates still cover the supported matrix:
+
+- Python 3.11, 3.12, 3.13, and 3.14;
+- Ubuntu, Windows, and macOS;
+- the base test suite across the release compatibility matrix;
+- CPU-only PyTorch tests;
+- dependency, workflow, legal, and package policy checks when their path rules
+  select them.
+
+The conditional `Release preflight` job runs in the locked `ci-release`
+environment. It performs the release-specific work:
+
+1. Builds the final wheel and sdist.
+2. Runs `twine check` on those files.
+3. Verifies their license and notice contents.
+4. Installs the final wheel into a clean virtual environment and imports
+   `albumentations` outside the checkout.
+5. Checks `uv.lock` freshness.
+6. Verifies golden regression vectors and runs the regression/property suite.
+7. Collects benchmark coverage and compares the previous reachable release
+   tag with the release candidate using the bounded `release-core` profile. The
+   preflight stores exact refs, raw ASV output, a comparison summary, and a
+   strict performance budget; missing comparison evidence blocks the bundle.
+8. Audits locked runtime dependencies and GitHub Actions workflows.
+9. Generates the CycloneDX SBOM and Correctness & Compatibility Report.
+10. Creates checksums and an immutable release manifest.
+
+The core performance profile passes `--core-only` because it does not run the
+dedicated Tensor benchmark matrix. The dedicated PyTorch PR job validates that
+Tensor lane with CPU Torch installed. Direct leaf jobs are the required PR
+contexts; release preflight is the additional release-specific context.
+
+## The PR Produces the Final Bundle
+
+A successful preflight uploads one artifact named:
+
+```text
+release-bundle-<version>-<tracked-tree-sha256>
+```
+
+The bundle contains:
+
+```text
+dist/*.whl
+dist/*.tar.gz
+public/*-sbom.cdx.json
+public/*-correctness-compatibility-report.md
+public/SHA256SUMS.txt
+evidence/**
+release-manifest.json
+```
+
+`release-manifest.json` records the version, source commit, tracked-tree
+SHA-256, expiry, successful checks, publishable paths, and SHA-256 of every
+payload file. The artifact is uploaded only after the preflight succeeds.
+Failed preflights upload a separate diagnostic artifact that cannot be selected
+for publication.
+
+The **Pin release tag** workflow handles both PR merge and PR workflow
+completion, so it works whether CI finishes before or after the merge. It reads
+the version and source digest from the merged PR commit and resolves the exact
+successful bundle before creating the tag. Automation runs from the default
+branch; the separate source checkout is read only for version and digest
+calculation. It does not build or execute that checkout.
+
+An existing tag on the same commit is preserved. A tag on a different commit
+blocks tagging and is never moved automatically. If a manually selected tag
+differs from the checked tree, publication stops before any external upload.
+
+## Publish Only Delivers Verified Bytes
+
+The `release: published` workflow performs these steps:
+
+1. Checks out the released tag.
+2. Verifies that the tag matches `project.version`.
+3. Computes the tracked-tree SHA-256 and derives the exact bundle name.
+4. Resolves the immutable artifact ID through the GitHub API.
+5. Accepts artifacts only from the PR workflow, targeting `main`, with a
+   successful run and a merged originating pull request.
+6. Downloads the exact artifact ID and verifies the GitHub artifact digest.
+7. Verifies the release manifest, expiry, source digest, declared file set, and
+   every payload SHA-256.
+8. Attaches the wheel, sdist, SBOM, report, and checksums to the GitHub Release.
+9. Publishes the same wheel and sdist to PyPI through trusted publishing.
+
+The publish workflow does not build distributions, run tests, run `twine`,
+repeat legal/security/performance checks, or regenerate public artifacts.
+
+Permissions stay separated:
+
+- the resolver receives `actions: read` and `contents: read`;
+- the GitHub asset job receives `contents: write`;
+- only the PyPI job receives `id-token: write` and the `pypi` environment.
+
+## Official Release Artifacts
+
+Each release publishes:
+
+- source distribution;
+- wheel;
+- `SHA256SUMS.txt`;
+- CycloneDX SBOM in JSON format;
+- Correctness & Compatibility Report in Markdown format;
+- PyPI provenance generated by trusted publishing.
+
+The wheel and sdist contain exact copies of `LICENSE`, `LICENSING.md`,
+`THIRD_PARTY_NOTICES.md`, and the preserved Albumentations 2.0.8 MIT notice.
+They exclude the inbound `CLA.md`, private acceptance records, the CLA archive,
+See [License and CLA Provenance](license-provenance.md) for the complete
+contract.
+
+## Local Checks
+
+CI runs the release preflight automatically. To reproduce its focused source
+and packaging checks locally:
+
+```bash
+uv lock --check
+uv run python -m tools.ci_matrix check
+uv run pytest -q \
+  tests/test_ci_plan.py \
+  tests/test_pr_workflow.py \
+  tests/test_release_bundle.py \
+  tests/test_release_workflow.py \
+  tests/test_performance_budget.py
+uv run python tools/verify_regression_vectors.py --all
+uv run pytest -q tests/regression tests/property --hypothesis-profile=ci-fast
+
+artifact_dir="$(mktemp -d)"
+uv build --out-dir "${artifact_dir}"
+uv run python tools/verify_legal_integrity.py \
+  --artifacts "${artifact_dir}"/*.whl "${artifact_dir}"/*.tar.gz
+uv run twine check "${artifact_dir}"/*
+```
+
+Always build into a fresh directory outside the checkout. A stale distribution
+inside the repository can contaminate an sdist or be mistaken for the current
+release.
+
+## Verify the Published Release
+
+After the delivery workflow succeeds:
+
+1. Confirm that all five public assets exist on the GitHub Release.
+2. Run `sha256sum -c SHA256SUMS.txt` against the downloaded assets.
+3. Confirm that PyPI lists the same version and wheel/sdist hashes.
+4. Confirm that PyPI file details show trusted-publishing provenance.
+
+See [Release Verification](release-verification.md) for downstream verification
+and trust-root details.
+
+## Failure and Recovery
+
+| Failure | Recovery |
+| --- | --- |
+| Version-bump PR preflight fails | Fix the PR. Do not publish the GitHub Release. |
+| Version tag has not appeared after merge | Check **Pin release tag** and the originating PR workflow. Re-run the tagging job once the PR workflow succeeds. |
+| No matching bundle exists | Re-run the original merged PR workflow while GitHub still allows it. Otherwise increase to a new patch version and use a new version-bump PR. |
+| Bundle expired | Increase to a new patch version and create a fresh bundle through the version-bump PR gate. |
+| Tag and version differ | Correct the release/tag before external upload. |
+| Source or payload digest differs | Stop publication, inspect provenance, and use a new patch version with a fresh version-bump PR. |
+| GitHub or PyPI has a transient failure | Re-run the affected delivery job with the same verified bundle. |
+| PyPI already contains the version | Do not overwrite it. Inspect the conflict and publish a new patch version if needed. |
+| A published package has a runtime defect | Yank it where appropriate and publish the smallest safe patch release. |
+
+Never publish different bytes under an existing version.
+
+## Optional Release Candidate Verification
+
+`.github/workflows/release-candidate.yml` remains available for unusual,
+high-risk releases. Its blank benchmark filter selects `release-core`; maintainers
+can provide an explicit regex when a full-family comparison is justified. It
+is not part of the normal release path.
+
+## Security Releases
+
+For coordinated security releases:
+
+1. Keep issue details private until users can obtain the fixed package.
+2. Prepare the patch on a private branch or restricted fork when needed.
+3. Run the same release gate in the restricted environment.
+4. Publish the package, GitHub Security Advisory, and release notes in the
+   coordinated order.
+
+## Ownership and Trusted Publishing
+
+- Primary release owner: Vladimir Iglovikov
+- Backup release owner: Mikhail Druzhinin
+
+PyPI must have a trusted-publisher entry for this repository, the
+`.github/workflows/upload_to_pypi.yml` workflow, and the `pypi` environment.

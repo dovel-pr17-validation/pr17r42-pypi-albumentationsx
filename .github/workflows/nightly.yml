@@ -1,0 +1,200 @@
+name: Nightly Verification
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility_matrix:
+    name: Full compatibility (${{ matrix.operating-system }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.operating-system }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        operating-system: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up test environment
+      uses: ./.github/actions/setup-ci
+      with:
+        python-version: ${{ matrix.python-version }}
+        dependency-group: ci-test
+        runtime-profile: torch-cpu
+    - name: Run complete base suite
+      shell: bash
+      run: |
+        mkdir -p nightly-evidence
+        python -m tools.ci_shard select --shard-count 1 --shard-index 0 \
+          --exclude-file tests/test_pytorch.py \
+          --exclude-file tests/transforms3d/test_pytorch.py \
+          | xargs -0 python -m pytest \
+          -n 2 --dist=worksteal -m "not pytorch" \
+          --hypothesis-profile=ci-fast \
+          --junitxml=nightly-evidence/junit.xml
+    - name: Upload compatibility evidence
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: nightly-compatibility-${{ matrix.operating-system }}-${{ matrix.python-version }}
+        path: nightly-evidence/
+        if-no-files-found: ignore
+
+  pytorch:
+    name: PyTorch compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up PyTorch test environment
+      uses: ./.github/actions/setup-ci
+      with:
+        python-version: "3.12"
+        dependency-group: ci-test
+        runtime-profile: torch-cpu
+    - name: Run PyTorch-marked tests
+      run: >-
+        python -m pytest -n 2 --dist=worksteal -m pytorch
+        tests/test_pytorch.py
+        tests/transforms3d/test_pytorch.py
+        tests/test_per_worker_seed.py
+        tests/test_flip_masks_comprehensive.py
+        tests/test_additional_targets.py
+
+  lower_bound_dependencies:
+    name: Lower-bound dependency check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Install shared Python and uv bootstrap
+      uses: albumentations-team/ci-foundation/actions/setup-python-uv@6b9045dbea58026a1e8f96b0392c411934a27199
+      with:
+        activate-environment: true
+        cache-dependency-glob: pyproject.toml
+        cache-suffix: nightly-lower-bound
+        python-version: "3.11"
+        uv-version: "0.12.0"
+    - name: Install declared minimum runtime dependencies
+      run: uv pip install --resolution lowest-direct --strict -e ".[headless]"
+    - name: Install test dependencies
+      run: uv pip install hypothesis pytest
+    - name: Install CPU-only Torch runtime
+      uses: albumentations-team/ci-foundation/actions/torch-cpu@6b9045dbea58026a1e8f96b0392c411934a27199
+      with:
+        mode: install
+        python: python
+        requirement: "torch>=2.13.0"
+    - name: Prepare nightly evidence directory
+      run: python -c "from pathlib import Path; Path('nightly-evidence').mkdir(exist_ok=True)"
+    - name: Collect lower-bound environment evidence
+      run: >
+        python tools/collect_test_environment.py
+        --output nightly-evidence/environment-lower-bound.json
+        --command "lower-bound dependency pytest"
+    - name: Run representative lower-bound tests
+      run: >
+        python -m pytest -q
+        tests/test_core.py::test_compose
+        tests/regression
+        --junitxml=nightly-evidence/junit-lower-bound.xml
+    - name: Summarize lower-bound pytest results
+      if: always()
+      run: >
+        python tools/pytest_summary.py
+        --junit nightly-evidence/junit-lower-bound.xml
+        --output nightly-evidence/pytest-summary-lower-bound.json
+        --allow-incomplete
+    - name: Upload lower-bound evidence
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: lower-bound-evidence
+        path: nightly-evidence/
+        if-no-files-found: ignore
+
+  property_and_regression:
+    name: Property and regression verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up test environment
+      uses: ./.github/actions/setup-ci
+      with:
+        python-version: "3.14"
+        dependency-group: ci-test
+        runtime-profile: torch-cpu
+    - name: Prepare nightly evidence directory
+      run: python -c "from pathlib import Path; Path('nightly-evidence').mkdir(exist_ok=True)"
+    - name: Verify golden vectors
+      run: python tools/verify_regression_vectors.py --all
+    - name: Run property and regression tests
+      run: >
+        python -m pytest -q tests/regression tests/property
+        --hypothesis-profile=ci-nightly
+        --junitxml=nightly-evidence/junit-property-regression.xml
+    - name: Collect property environment evidence
+      if: always()
+      run: >
+        python tools/collect_test_environment.py
+        --output nightly-evidence/environment-property-regression.json
+        --command "pytest tests/regression tests/property --hypothesis-profile=ci-nightly"
+    - name: Summarize property pytest results
+      if: always()
+      run: >
+        python tools/pytest_summary.py
+        --junit nightly-evidence/junit-property-regression.xml
+        --output nightly-evidence/pytest-summary-property-regression.json
+        --allow-incomplete
+    - name: Upload property evidence
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: property-regression-evidence
+        path: nightly-evidence/
+        if-no-files-found: ignore
+
+  optional_extras:
+    name: Optional extras smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up test environment
+      uses: ./.github/actions/setup-ci
+      with:
+        python-version: "3.14"
+        dependency-group: ci-test
+        runtime-profile: torch-cpu
+    - name: Install optional extras
+      run: >
+        uv sync --locked --no-default-groups --group ci-test --inexact
+        --group ci-torch-cpu
+        --extra hub
+        --extra contrib-headless
+    - name: Run optional extras smoke tests
+      run: python -m pytest -q tests/test_hub_mixin.py
+    - name: Collect optional extras environment
+      if: always()
+      run: >
+        python tools/collect_test_environment.py
+        --output nightly-evidence/environment-optional-extras.json
+        --command "optional extras smoke"
+    - name: Upload optional extras evidence
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: optional-extras-evidence
+        path: nightly-evidence/
+        if-no-files-found: ignore

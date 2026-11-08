@@ -1,0 +1,1706 @@
+from typing import Any
+from unittest.mock import Mock
+
+import cv2
+import numpy as np
+import pytest
+import torch
+import torch.nn.functional as torch_f
+from albucore import pad3d
+
+import albumentations as A
+from albumentations.augmentations.transforms3d import functional as f3d
+from albumentations.core.invocation import SamplingContext
+from albumentations.core.transform_params import SampledParams, TargetSet
+from albumentations.core.type_definitions import Targets
+from tests.conftest import RECTANGULAR_UINT8_IMAGE
+from tests.utils import (
+    get_primary_2d_transform_params,
+    get_primary_3d_transform_params,
+    get_primary_dual_transform_params,
+    make_sampling_args,
+)
+
+
+@pytest.mark.parametrize(
+    ("source_shape", "size"),
+    [
+        ((3, 4, 5, 1), (6, 2, 1)),
+        ((1, 4, 5, 3), (3, 8, 10)),
+        ((3, 5, 4, 9), (1, 10, 8)),
+    ],
+)
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+def test_resize_3d_preserves_shape_dtype_and_mask_labels(source_shape, size, dtype):
+    rng = np.random.default_rng(137)
+    if dtype == np.uint8:
+        volume = rng.integers(0, 256, source_shape, dtype=dtype)
+    else:
+        volume = rng.random(source_shape, dtype=dtype)
+    mask3d = rng.integers(0, 4, source_shape[:3], dtype=np.uint8)
+
+    transform = A.Compose([A.Resize3D(size=size, p=1.0)], strict=True)
+    result = transform(volume=volume, mask3d=mask3d)
+
+    assert result["volume"].shape == (*size, source_shape[-1])
+    assert result["mask3d"].shape == size
+    assert result["volume"].dtype == dtype
+    assert result["mask3d"].dtype == mask3d.dtype
+    assert set(np.unique(result["mask3d"])).issubset(set(np.unique(mask3d)))
+    if dtype == np.uint8:
+        assert result["volume"].min() >= 0
+        assert result["volume"].max() <= 255
+
+
+def test_resize_3d_identity_and_integer_nearest_scale_are_exact():
+    volume = np.arange(8, dtype=np.uint8).reshape(2, 2, 2, 1)
+    mask3d = np.arange(8, dtype=np.uint8).reshape(2, 2, 2)
+
+    identity = A.Compose([A.Resize3D(size=(2, 2, 2), p=1.0)], strict=True)
+    identity_result = identity(volume=volume, mask3d=mask3d)
+    np.testing.assert_array_equal(identity_result["volume"], volume)
+    np.testing.assert_array_equal(identity_result["mask3d"], mask3d)
+
+    transform = A.Compose(
+        [
+            A.Resize3D(
+                size=(4, 4, 4),
+                interpolation=cv2.INTER_NEAREST,
+                mask_interpolation=cv2.INTER_NEAREST,
+                p=1.0,
+            ),
+        ],
+        strict=True,
+    )
+    result = transform(volume=volume, mask3d=mask3d)
+    expected_volume = np.repeat(np.repeat(np.repeat(volume, 2, axis=0), 2, axis=1), 2, axis=2)
+    expected_mask3d = np.repeat(np.repeat(np.repeat(mask3d, 2, axis=0), 2, axis=1), 2, axis=2)
+    np.testing.assert_array_equal(result["volume"], expected_volume)
+    np.testing.assert_array_equal(result["mask3d"], expected_mask3d)
+
+
+@pytest.mark.parametrize("mask_target", ["mask3d", "masks3d"])
+def test_coarse_dropout3d_respects_fill_mask_none_for_mask_targets(mask_target: str) -> None:
+    volumes = np.ones((2, 3, 5, 7, 1), dtype=np.uint8)
+    mask = np.ones((3, 5, 7), dtype=np.uint8) if mask_target == "mask3d" else np.ones((2, 3, 5, 7), dtype=np.uint8)
+    transform = A.Compose(
+        [
+            A.CoarseDropout3D(
+                num_holes_range=(1, 1),
+                hole_depth_range=(1.0, 1.0),
+                hole_height_range=(1.0, 1.0),
+                hole_width_range=(1.0, 1.0),
+                fill=0,
+                fill_mask=None,
+                p=1.0,
+            ),
+        ],
+        strict=True,
+        seed=137,
+    )
+
+    result = transform(volumes=volumes, **{mask_target: mask})
+
+    np.testing.assert_array_equal(result["volumes"], np.zeros_like(volumes))
+    np.testing.assert_array_equal(result[mask_target], mask)
+
+
+def test_resize_3d_matches_trilinear_reference():
+    volume = np.random.default_rng(137).random((3, 4, 5, 3), dtype=np.float32)
+    size = (5, 3, 7)
+    expected = (
+        torch_f.interpolate(
+            torch.from_numpy(volume).permute(3, 0, 1, 2).unsqueeze(0),
+            size=size,
+            mode="trilinear",
+            align_corners=False,
+        )
+        .squeeze(0)
+        .permute(1, 2, 3, 0)
+        .numpy()
+    )
+
+    result = A.Compose([A.Resize3D(size=size, p=1.0)], strict=True)(volume=volume)["volume"]
+
+    np.testing.assert_allclose(result, expected, rtol=2e-4, atol=3e-5)
+
+
+def test_resize_3d_accepts_tensor_volume():
+    volume = np.random.default_rng(137).random((3, 4, 5, 2), dtype=np.float32)
+    tensor = torch.from_numpy(np.ascontiguousarray(volume.transpose(3, 0, 1, 2)))
+
+    result = A.Compose([A.Resize3D(size=(5, 3, 7), p=1.0)], strict=True)(volume=tensor)["volume"]
+
+    assert isinstance(result, torch.Tensor)
+    assert result.shape == (2, 5, 3, 7)
+    assert result.dtype == torch.float32
+
+
+def test_resize_3d_scales_xyz_keypoints():
+    volume = np.zeros((2, 4, 8, 1), dtype=np.uint8)
+    keypoints = np.array([[2.0, 2.0, 1.0], [6.0, 1.0, 0.0]], dtype=np.float32)
+    keypoint_labels = [7, 9]
+    transform = A.Compose(
+        [A.Resize3D(size=(4, 2, 16), p=1.0)],
+        keypoint_params=A.KeypointParams(coord_format="xyz", label_fields=["keypoint_labels"]),
+        strict=True,
+    )
+
+    result = transform(volume=volume, keypoints=keypoints, keypoint_labels=keypoint_labels)
+
+    np.testing.assert_allclose(result["keypoints"], [[4.5, 0.75, 2.5], [12.5, 0.25, 0.5]])
+    assert result["keypoint_labels"] == keypoint_labels
+
+
+def test_resize_3d_keypoint_tracks_volume_blob() -> None:
+    depth, height, width = 21, 65, 97
+    center_x, center_y, center_z = 20.25, 24.5, 10.25
+    x = np.arange(width)[None, None, :] + 0.5
+    y = np.arange(height)[None, :, None] + 0.5
+    z = np.arange(depth)[:, None, None] + 0.5
+    volume = np.exp(-((x - center_x) ** 2 + (y - center_y) ** 2 + (z - center_z) ** 2) / 18).astype(np.float32)
+    augmented = A.Compose(
+        [A.Resize3D(size=(29, 94, 155), p=1)],
+        keypoint_params=A.KeypointParams(coord_format="xyz", remove_invisible=False),
+        telemetry=False,
+    )(volume=volume[..., None], keypoints=[(center_x - 0.5, center_y - 0.5, center_z - 0.5)])
+
+    output_volume = augmented["volume"][..., 0]
+    output_depth, output_height, output_width = output_volume.shape
+    mass = output_volume.sum(dtype=np.float64)
+    volume_center = np.array(
+        [
+            (output_volume.sum(axis=(0, 1), dtype=np.float64) * (np.arange(output_width) + 0.5)).sum() / mass,
+            (output_volume.sum(axis=(0, 2), dtype=np.float64) * (np.arange(output_height) + 0.5)).sum() / mass,
+            (output_volume.sum(axis=(1, 2), dtype=np.float64) * (np.arange(output_depth) + 0.5)).sum() / mass,
+        ],
+    )
+    keypoint_center = np.asarray(augmented["keypoints"][0]) + 0.5
+    np.testing.assert_allclose(keypoint_center, volume_center, atol=0.02)
+
+
+def test_resize_3d_keeps_edge_keypoint_inside_volume() -> None:
+    augmented = A.Compose(
+        [A.Resize3D(size=(2, 2, 2), p=1)],
+        keypoint_params=A.KeypointParams(coord_format="xyz"),
+        telemetry=False,
+    )(volume=np.ones((4, 4, 4, 1), dtype=np.float32), keypoints=[(0, 0, 0)])
+
+    np.testing.assert_array_equal(augmented["keypoints"], [(-0.25, -0.25, -0.25)])
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.int64])
+def test_resize_3d_preserves_keypoint_attributes_after_xyz_coordinates(dtype: type[np.generic]) -> None:
+    keypoints = np.array([[2.0, 2.0, 1.0, 7.0, 11.0], [6.0, 1.0, 0.0, 9.0, 13.0]], dtype=dtype)
+
+    result = f3d.keypoints_scale_3d(
+        keypoints,
+        source_shape=(2, 4, 8),
+        target_shape=(4, 2, 16),
+    )
+
+    np.testing.assert_array_equal(result, [[4.5, 0.75, 2.5, 7.0, 11.0], [12.5, 0.25, 0.5, 9.0, 13.0]])
+
+
+@pytest.mark.parametrize("interpolation", [cv2.INTER_CUBIC, cv2.INTER_AREA])
+def test_resize_3d_rejects_unsupported_interpolation(interpolation):
+    with pytest.raises(ValueError, match="Input should be 0 or 1"):
+        A.Resize3D(size=(2, 3, 4), interpolation=interpolation)
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+def test_pad_if_needed_3d_preserves_large_integer_mask_labels(dtype):
+    mask = np.full((64, 96, 128), 2**24 + 137, dtype=dtype)
+    result = A.Compose([A.PadIfNeeded3D(min_zyx=(66, 98, 130), fill_mask=-137)])(mask3d=mask)["mask3d"]
+    expected = np.pad(mask, 1, constant_values=-137)
+    assert result.dtype == mask.dtype
+    np.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize("tensor_volume", [False, True])
+@pytest.mark.parametrize("tensor_mask", [False, True])
+@pytest.mark.parametrize("fill", [-1.0, (3.0, 7.0)])
+def test_pad_if_needed_3d_albucore_dispatch(monkeypatch, tensor_volume, tensor_mask, fill):
+    volume = np.arange(72, dtype=np.uint8).reshape(2, 3, 4, 3)
+    mask = np.arange(24, dtype=np.int16).reshape(2, 3, 4, 1)
+    source = torch.from_numpy(volume).permute(3, 0, 1, 2).contiguous() if tensor_volume else volume
+    source_mask = torch.from_numpy(mask).permute(3, 0, 1, 2).contiguous() if tensor_mask else mask
+    padding = ((3, 3), (2, 3), (2, 2), (0, 0))
+    expected = np.pad(volume, padding, constant_values=fill)
+    expected_mask = np.pad(mask, padding, constant_values=-137)
+    kernel = Mock(wraps=pad3d)
+    monkeypatch.setattr(f3d, "pad3d", kernel)
+
+    result = A.PadIfNeeded3D(min_zyx=(7, 7, 7), pad_divisor_zyx=(4, 4, 4), fill=fill, fill_mask=-137)(
+        volume=source,
+        mask3d=source_mask,
+    )
+
+    assert kernel.call_count == 2
+    assert kernel.call_args_list[0].args[0] is source
+    assert kernel.call_args_list[1].args[0] is source_mask
+    for name, original, reference in (("volume", source, expected), ("mask3d", source_mask, expected_mask)):
+        actual = result[name]
+        assert type(actual) is type(original)
+        assert actual.dtype == original.dtype
+        if isinstance(actual, torch.Tensor):
+            actual = actual.permute(1, 2, 3, 0).numpy()
+        np.testing.assert_array_equal(actual, reference)
+    original_volume = source.permute(1, 2, 3, 0).numpy() if tensor_volume else source
+    np.testing.assert_array_equal(original_volume, np.arange(72, dtype=np.uint8).reshape(2, 3, 4, 3))
+    original_mask = source_mask.permute(1, 2, 3, 0).numpy() if tensor_mask else source_mask
+    np.testing.assert_array_equal(original_mask, np.arange(24, dtype=np.int16).reshape(2, 3, 4, 1))
+
+
+@pytest.mark.parametrize(
+    ["volume_shape", "min_zyx", "pad_divisor_zyx", "expected_shape"],
+    [
+        ((2, 3, 4), (2, 3, 4), None, (2, 3, 4)),
+        ((2, 3, 4), (1, 2, 3), None, (2, 3, 4)),
+        ((2, 3, 4), (2, 8, 8), None, (2, 8, 8)),
+        ((2, 3, 4), (8, 8, 8), None, (8, 8, 8)),
+        ((2, 3, 4), (5, 3, 4), None, (5, 3, 4)),
+        ((2, 3, 4), (2, 8, 4), None, (2, 8, 4)),
+        ((2, 3, 4), (2, 3, 9), None, (2, 3, 9)),
+        ((2, 3, 4), None, (3, 4, 5), (3, 4, 5)),
+        ((4, 6, 8), None, (2, 3, 4), (4, 6, 8)),
+        ((2, 3, 4), (7, 8, 9), (4, 3, 2), (8, 9, 10)),
+        ((9, 8, 7), (3, 4, 5), (4, 3, 2), (12, 9, 8)),
+    ],
+)
+@pytest.mark.parametrize("position", ["center", "random"])
+@pytest.mark.parametrize("seed", [137, 42])
+def test_pad_if_needed_3d_shapes(volume_shape, min_zyx, pad_divisor_zyx, expected_shape, position, seed):
+    volume = np.zeros(volume_shape, dtype=np.uint8)
+    transform = A.Compose(
+        [A.PadIfNeeded3D(min_zyx=min_zyx, pad_divisor_zyx=pad_divisor_zyx, position=position)],
+        seed=seed,
+        strict=True,
+    )
+    transformed = transform(volume=volume)
+    assert transformed["volume"].shape == expected_shape
+
+
+@pytest.mark.parametrize("position", ["center", "random"])
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+@pytest.mark.parametrize("seed", [137, 42])
+def test_pad_if_needed_3d_positions(position, dtype, seed):
+    volume = np.arange(1, 25, dtype=dtype).reshape(2, 3, 4)
+    if dtype == np.float32:
+        volume /= 32
+    mask3d = (np.arange(24, dtype=np.uint8).reshape(2, 3, 4) % 3) + 1
+    keypoints = np.array([[0, 0, 0], [3, 2, 1]], dtype=np.float32)
+    transform = A.Compose(
+        [A.PadIfNeeded3D(min_zyx=(8, 8, 8), position=position, fill=0, fill_mask=0)],
+        keypoint_params=A.KeypointParams(coord_format="xyz"),
+        seed=seed,
+        strict=True,
+    )
+    transformed = transform(volume=volume, mask3d=mask3d, keypoints=keypoints)
+    padded_volume = transformed["volume"]
+    assert padded_volume.shape == (8, 8, 8)
+    assert padded_volume.dtype == volume.dtype
+    assert transformed["mask3d"].dtype == mask3d.dtype
+
+    offset = np.argwhere(padded_volume != 0).min(axis=0)
+    if position == "center":
+        np.testing.assert_array_equal(offset, [3, 2, 2])
+    region = tuple(slice(start, start + size) for start, size in zip(offset, volume.shape, strict=True))
+    expected_volume = np.zeros((8, 8, 8), dtype=dtype)
+    expected_volume[region] = volume
+    expected_mask = np.zeros((8, 8, 8), dtype=mask3d.dtype)
+    expected_mask[region] = mask3d
+    np.testing.assert_array_equal(padded_volume, expected_volume)
+    np.testing.assert_array_equal(transformed["mask3d"], expected_mask)
+    np.testing.assert_array_equal(transformed["keypoints"], keypoints + offset[::-1])
+
+    transform.set_random_seed(seed)
+    repeated = transform(volume=volume, mask3d=mask3d, keypoints=keypoints)
+    for target in ("volume", "mask3d", "keypoints"):
+        np.testing.assert_array_equal(repeated[target], transformed[target])
+
+
+def test_pad_if_needed_3d_2d_equivalence():
+    """Test that PadIfNeeded3D behaves like PadIfNeeded when no z-padding is needed"""
+    # Create a volume with multiple identical slices
+    slice_2d = np.random.randint(0, 256, (100, 100, 1), dtype=np.uint8)
+    volume_3d = np.stack([slice_2d] * 10)
+
+    # Apply 3D padding with no z-axis changes
+    transform_3d = A.PadIfNeeded3D(
+        min_zyx=(10, 128, 128),
+        position="center",
+        fill=0,
+        fill_mask=0,
+    )
+    transformed_3d = transform_3d(volume=volume_3d)
+
+    # Apply 2D padding to a single slice
+    transform_2d = A.PadIfNeeded(
+        min_height=128,
+        min_width=128,
+        position="center",
+        border_mode=cv2.BORDER_CONSTANT,
+        fill=0,
+        fill_mask=0,
+    )
+    transformed_2d = transform_2d(image=slice_2d)
+
+    # Compare each slice of 3D result with 2D result
+    for slice_idx in range(10):
+        np.testing.assert_array_equal(
+            transformed_3d["volume"][slice_idx],
+            transformed_2d["image"],
+        )
+
+
+def test_pad_if_needed_3d_fill_values():
+    volume = np.zeros((5, 50, 50, 1), dtype=np.uint8)
+    mask3d = np.ones((5, 50, 50, 1), dtype=np.uint8)
+
+    transform = A.PadIfNeeded3D(
+        min_zyx=(10, 100, 100),
+        position="center",
+        fill=255,
+        fill_mask=128,
+    )
+
+    transformed = transform(volume=volume, mask3d=mask3d)
+
+    # Check fill values in padded regions
+    np.testing.assert_array_equal(transformed["volume"][:, :25, :], 255)  # top padding
+    np.testing.assert_array_equal(transformed["mask3d"][:, :25, :], 128)  # top padding in mask
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_3d_transform_params(
+        custom_arguments={
+            A.PadIfNeeded3D: {"min_zyx": (4, 250, 230), "position": "center", "fill": 0, "fill_mask": 0},
+        },
+        except_augmentations={},
+    ),
+)
+def test_augmentations_match_uint8_float32(augmentation_cls, params):
+    image_uint8 = RECTANGULAR_UINT8_IMAGE
+    image_float32 = image_uint8.astype(np.float32) / 255.0
+
+    transform = A.Compose([augmentation_cls(p=1, **params)], seed=42)
+
+    volume = np.stack([image_uint8, image_uint8])
+
+    data = {"volume": volume}
+
+    transformed_uint8 = transform(**data)["volume"]
+
+    data["volume"] = np.stack([image_float32, image_float32])
+
+    transform.set_random_seed(42)
+    transformed_float32 = transform(**data)["volume"]
+
+    np.testing.assert_array_almost_equal(transformed_uint8 / 255.0, transformed_float32, decimal=2)
+
+
+@pytest.mark.parametrize(
+    ["padding", "expected_shape"],
+    [
+        # Single int - pad all sides equally
+        (2, (14, 14, 14, 1)),  # 10+2+2 = 14 for each dimension
+        # 3-tuple - symmetric padding per dimension
+        ((1, 2, 3), (12, 14, 16, 1)),  # d+2, h+4, w+6
+        # 6-tuple - specific padding per side
+        ((1, 2, 3, 2, 1, 4), (13, 15, 15, 1)),  # (d+3, h+3, w+7)
+        # Zero padding
+        (0, (10, 10, 10, 1)),  # Original shape
+    ],
+)
+def test_pad3d_shapes(padding, expected_shape):
+    volume = np.ones((10, 10, 10, 1), dtype=np.float32)
+    augmentation = A.Pad3D(padding=padding)
+    padded = augmentation(volume=volume)["volume"]
+    assert padded.shape == expected_shape
+
+
+@pytest.mark.parametrize(
+    ["fill", "fill_mask"],
+    [
+        (0, 1),
+        (1, 0),
+    ],
+)
+def test_pad3d_fill_values(fill, fill_mask):
+    volume = np.ones((3, 3, 3, 1), dtype=np.float32)
+    mask3d = np.ones((3, 3, 3, 1), dtype=np.float32)
+
+    augmentation = A.Pad3D(padding=1, fill=fill, fill_mask=fill_mask)
+    transformed = augmentation(volume=volume, mask3d=mask3d)
+
+    padded_volume = transformed["volume"]
+    padded_mask = transformed["mask3d"]
+
+    # Check fill values in padded regions
+    np.testing.assert_array_equal(padded_volume[0, :, :], fill)  # front slice
+    np.testing.assert_array_equal(padded_mask[0, :, :], fill_mask)  # front slice of mask
+
+
+@pytest.mark.parametrize(
+    "volume_shape",
+    [
+        (10, 10, 10),  # 3D
+        (10, 10, 10, 1),  # 4D single channel
+        (10, 10, 10, 3),  # 4D multi-channel
+    ],
+)
+def test_pad3d_different_shapes(volume_shape):
+    volume = np.ones(volume_shape, dtype=np.float32)
+    augmentation = A.Compose([A.Pad3D(padding=2)])
+    padded = augmentation(volume=volume)["volume"]
+
+    expected_shape = tuple(s + 4 for s in volume_shape[:3])  # +4 because padding=2 on each side
+    if len(volume_shape) == 4:
+        expected_shape += (volume_shape[3],)
+
+    assert padded.shape == expected_shape
+
+
+def test_pad3d_different_dtypes():
+    for dtype in [np.uint8, np.float32]:
+        volume = np.ones((5, 5, 5, 1), dtype=dtype)
+        augmentation = A.Pad3D(padding=1)
+        padded = augmentation(volume=volume)["volume"]
+        assert padded.dtype == dtype
+
+
+def test_pad3d_preservation():
+    """Test that the original data is preserved in the non-padded region"""
+    volume = np.random.randint(0, 255, (5, 5, 5, 1), dtype=np.uint8)
+    augmentation = A.Pad3D(padding=2)
+    padded = augmentation(volume=volume)["volume"]
+
+    # Check if the original volume is preserved in the center
+    np.testing.assert_array_equal(
+        padded[2:-2, 2:-2, 2:-2],
+        volume,
+    )
+
+
+@pytest.mark.parametrize(
+    ["pad3d_padding", "pad2d_padding"],
+    [
+        # 6-tuple for 3D (z_front, z_back, y_top, y_bottom, x_left, x_right) vs
+        # 4-tuple for 2D (y_top, y_bottom, x_left, x_right)
+        ((0, 0, 10, 10, 20, 20), (20, 10, 20, 10)),
+        # 3-tuple for 3D (d,h,w) vs 2-tuple for 2D (w,h) - symmetric padding
+        ((0, 10, 20), (20, 10)),
+    ],
+    ids=[
+        "explicit_padding",
+        "symmetric_padding",
+    ],
+)
+def test_pad3d_2d_equivalence(pad3d_padding, pad2d_padding):
+    """Test that Pad3D behaves like Pad when no z-padding is applied"""
+    # Create a volume with multiple identical slices
+    num_slices = 4
+    slice_2d = np.random.randint(0, 256, (3, 3, 1), dtype=np.uint8)
+    volume_3d = np.stack([slice_2d] * num_slices)  # 10 identical slices
+
+    # Apply 3D padding with no z-axis changes
+    transform_3d = A.Pad3D(
+        padding=pad3d_padding,
+        fill=0,
+        fill_mask=0,
+    )
+    transformed_3d = transform_3d(volume=volume_3d)
+
+    # Apply 2D padding to a single slice
+    transform_2d = A.Pad(
+        padding=pad2d_padding,
+        fill=0,
+        fill_mask=0,
+    )
+    transformed_2d = transform_2d(image=slice_2d)
+
+    # Compare each slice of 3D result with 2D result
+    for slice_idx in range(num_slices):
+        np.testing.assert_array_equal(
+            transformed_3d["volume"][slice_idx],
+            transformed_2d["image"],
+        )
+
+    # Also verify that z dimension hasn't changed
+    assert transformed_3d["volume"].shape[0] == volume_3d.shape[0]
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_3d_transform_params(
+        custom_arguments={
+            A.Flip3D: {"flip_axes": (0,)},
+            A.RandomRotate90_3D: {"axis_pair": (0, 2), "group_element": "r90"},
+            A.CoarseDropout3D: {"fill_mask": 137},
+        },
+        except_augmentations={},
+    ),
+)
+def test_change_volume(volume, mask3d, augmentation_cls, params):
+    """Check that the volume changes and that only geometric transforms change the paired mask."""
+    aug = A.Compose([augmentation_cls(p=1, **params)], seed=0)
+
+    original_volume = volume.copy()
+    original_mask3d = mask3d.copy()
+
+    data = {
+        "volume": volume,
+        "mask3d": mask3d,
+    }
+    transformed = aug(**data)
+
+    assert not np.array_equal(transformed["volume"], original_volume)
+    if issubclass(augmentation_cls, A.VolumeOnlyTransform):
+        np.testing.assert_array_equal(transformed["mask3d"], original_mask3d)
+    else:
+        assert not np.array_equal(transformed["mask3d"], original_mask3d)
+
+
+@pytest.mark.parametrize(
+    ["transform", "input_shape", "expected_shape"],
+    [
+        # CenterCrop3D tests
+        (
+            A.CenterCrop3D(size=(4, 60, 60), pad_if_needed=False, fill=0, fill_mask=0),
+            (10, 100, 100),
+            (4, 60, 60),
+        ),
+        # RandomCrop3D tests
+        (
+            A.RandomCrop3D(size=(4, 60, 60), pad_if_needed=False, fill=0, fill_mask=0),
+            (10, 100, 100),
+            (4, 60, 60),
+        ),
+    ],
+    ids=[
+        "center_crop_3d",
+        "random_crop_3d",
+    ],
+)
+def test_crop_3d_shapes(transform, input_shape, expected_shape):
+    volume = np.random.randint(0, 256, input_shape, dtype=np.uint8)
+    transformed = transform(volume=volume)
+    assert transformed["volume"].shape == expected_shape
+
+
+@pytest.mark.parametrize(
+    "transform_cls",
+    [
+        A.CenterCrop3D,
+        A.RandomCrop3D,
+    ],
+    ids=[
+        "center_crop",
+        "random_crop",
+    ],
+)
+@pytest.mark.parametrize(
+    ["input_shape", "target_shape"],
+    [
+        pytest.param(
+            (10, 100, 100),
+            (16, 128, 128),
+            id="pad_all_dims",
+        ),
+        pytest.param(
+            (5, 100, 100),
+            (10, 50, 50),
+            id="pad_depth_only",
+        ),
+        pytest.param(
+            (10, 40, 100),
+            (8, 64, 50),
+            id="pad_height_only",
+        ),
+        pytest.param(
+            (10, 100, 40),
+            (8, 50, 64),
+            id="pad_width_only",
+        ),
+        pytest.param(
+            (10, 40, 40),
+            (8, 64, 64),
+            id="pad_height_width",
+        ),
+        pytest.param(
+            (10, 100, 100),
+            (8, 64, 64),
+            id="no_padding_needed",
+        ),
+    ],
+)
+def test_crop_3d_padding(transform_cls, input_shape, target_shape):
+    volume = np.random.randint(0, 256, input_shape, dtype=np.uint8)
+
+    transform = A.Compose([transform_cls(p=1, size=target_shape, pad_if_needed=True, fill=0, fill_mask=0)], seed=0)
+
+    transformed = transform(volume=volume)
+    assert transformed["volume"].shape == target_shape
+
+
+@pytest.mark.parametrize(
+    ["transform_cls", "size", "fill", "fill_mask"],
+    [
+        (A.CenterCrop3D, (4, 60, 60), 0, 1),
+        (A.CenterCrop3D, (4, 60, 60), 1, 0),
+        (A.RandomCrop3D, (4, 60, 60), 0, 1),
+        (A.RandomCrop3D, (4, 60, 60), 1, 0),
+    ],
+    ids=[
+        "center_crop_fill_0_mask_1",
+        "center_crop_fill_1_mask_0",
+        "random_crop_fill_0_mask_1",
+        "random_crop_fill_1_mask_0",
+    ],
+)
+def test_crop_3d_fill_values(transform_cls, size, fill, fill_mask):
+    volume = np.ones((3, 50, 50), dtype=np.uint8)
+    mask3d = np.zeros((3, 50, 50), dtype=np.uint8)
+
+    transform = A.Compose([transform_cls(p=1, size=size, pad_if_needed=True, fill=fill, fill_mask=fill_mask)], seed=0)
+
+    transformed = transform(volume=volume, mask3d=mask3d)
+    padded_volume = transformed["volume"]
+    padded_mask = transformed["mask3d"]
+
+    assert padded_volume.shape == size
+    assert padded_mask.shape == size
+
+    # Find padded regions by comparing with fill values
+    is_padding_volume = padded_volume == fill
+    is_padding_mask = padded_mask == fill_mask
+
+    # Check that some padding exists in each dimension that needs it
+    if size[0] > volume.shape[0]:
+        assert np.any(is_padding_volume[:, 0, 0])  # depth padding exists
+        assert np.any(is_padding_mask[:, 0, 0])
+
+    if size[1] > volume.shape[1]:
+        assert np.any(is_padding_volume[0, :, 0])  # height padding exists
+        assert np.any(is_padding_mask[0, :, 0])
+
+    if size[2] > volume.shape[2]:
+        assert np.any(is_padding_volume[0, 0, :])  # width padding exists
+        assert np.any(is_padding_mask[0, 0, :])
+
+    # Check that padding values are consistent
+    np.testing.assert_array_equal(padded_volume[is_padding_volume], fill)
+    np.testing.assert_array_equal(padded_mask[is_padding_mask], fill_mask)
+
+
+def test_random_crop_3d_reproducibility():
+    """Test that RandomCrop3D produces same results with same random seed"""
+    volume = np.random.randint(0, 256, (10, 100, 100), dtype=np.uint8)
+
+    transform = A.RandomCrop3D(size=(4, 60, 60))
+
+    # First run
+    transform.set_random_seed(42)
+    result1 = transform(volume=volume)["volume"]
+
+    # Second run
+    transform.set_random_seed(42)
+    result2 = transform(volume=volume)["volume"]
+
+    np.testing.assert_array_equal(result1, result2)
+
+
+@pytest.mark.parametrize(
+    "volume_shape",
+    [
+        (10, 100, 100),  # 3D
+        (10, 100, 100, 1),  # 4D single channel
+        (10, 100, 100, 3),  # 4D multi-channel
+    ],
+    ids=[
+        "3d_volume",
+        "4d_single_channel",
+        "4d_multi_channel",
+    ],
+)
+def test_crop_3d_different_shapes(volume_shape):
+    volume = np.random.randint(0, 256, volume_shape, dtype=np.uint8)
+
+    for transform_cls in [A.CenterCrop3D, A.RandomCrop3D]:
+        transform = transform_cls(size=(4, 60, 60))
+        transformed = transform(volume=volume)
+
+        expected_shape = (4, 60, 60)
+        if len(volume_shape) == 4:
+            expected_shape += (volume_shape[3],)
+
+        assert transformed["volume"].shape == expected_shape
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_3d_transform_params(
+        custom_arguments={},
+        except_augmentations={},
+    ),
+)
+def test_return_nonzero(volume, mask3d, augmentation_cls, params):
+    """Mistakes in clipping may lead to zero image, testing for that"""
+    aug = A.Compose([augmentation_cls(**params, p=1)], seed=42)
+
+    data = {
+        "volume": volume,
+        "mask3d": mask3d,
+    }
+
+    result = aug(**data)
+
+    assert np.max(result["volume"]) > 0
+    assert np.max(result["mask3d"]) > 0
+
+
+def test2d_3d(volume, mask3d):
+    transform = A.Compose([A.RandomCrop3D(size=(2, 30, 30), pad_if_needed=True, p=1), A.HorizontalFlip(p=1)])
+
+    transformed = transform(volume=volume, mask3d=mask3d)
+    assert np.max(transformed["volume"]) > 0
+    assert np.max(transformed["mask3d"]) > 0
+
+
+def _get_slice_wise_2d_transform_params():
+    return [
+        (augmentation_cls, params)
+        for augmentation_cls, params in get_primary_2d_transform_params(
+            custom_arguments={},
+            except_augmentations={
+                A.RandomSizedBBoxSafeCrop,
+                A.PixelDropout,
+                A.FDA,
+                A.MaskDropout,
+                A.CropNonEmptyMaskIfExists,
+                A.BBoxSafeRandomCrop,
+                A.OverlayElements,
+                A.PixelDistributionAdaptation,
+                A.HistogramMatching,
+                A.RandomCropNearBBox,
+                A.Mosaic,
+                A.GuidedCoarseDropout,
+                A.BBoxSubsetSafeRandomCrop,
+            },
+        )
+        if {Targets.IMAGE, Targets.IMAGES, Targets.VOLUME}.issubset(augmentation_cls._targets)
+        and getattr(augmentation_cls(**params, p=1), "_volume_sampling_is_slice_wise", True)
+    ]
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    _get_slice_wise_2d_transform_params(),
+)
+def test_image_volume_matching(image, augmentation_cls, params):
+    aug = A.Compose([augmentation_cls(**params, p=1)], seed=42)
+
+    volume = np.stack([image.copy()] * 4, axis=0)
+    images = np.stack([image.copy()] * 5, axis=0)
+
+    call_kw: dict[str, Any] = {
+        "image": image,
+        "volume": volume,
+        "images": images,
+    }
+    transformed = aug(**call_kw)
+
+    (
+        np.testing.assert_allclose(transformed["image"], transformed["images"][0], atol=4, rtol=1e-1),
+        f"Image shape = {transformed['image'].shape}, Images shape = {transformed['images'].shape}",
+    )
+    (
+        np.testing.assert_allclose(transformed["image"], transformed["volume"][0], atol=4, rtol=1e-1),
+        f"Image shape = {transformed['image'].shape}, Volume shape = {transformed['volume'].shape}",
+    )
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    _get_slice_wise_2d_transform_params(),
+)
+def test_image_transforms_matching(augmentation_cls, params):
+    # Use the same data for both to ensure transforms that depend on image content produce identical results
+    test_data = np.random.RandomState(42).randint(0, 256, (5, 100, 100, 3), dtype=np.uint8)
+
+    aug_1 = A.Compose([augmentation_cls(**params, p=1)], seed=137)
+    aug_2 = A.Compose([augmentation_cls(**params, p=1)], seed=137)
+
+    kw_images: dict[str, Any] = {"images": test_data.copy()}
+    kw_volume: dict[str, Any] = {"volume": test_data.copy()}
+    transformed_1 = aug_1(**kw_images)
+    transformed_2 = aug_2(**kw_volume)
+
+    np.testing.assert_allclose(
+        transformed_1["images"],
+        transformed_2["volume"],
+        atol=10,
+        rtol=0.2,
+        err_msg=f"Shape mismatch: images {transformed_1['images'].shape} vs volume {transformed_2['volume'].shape}",
+    )
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_dual_transform_params(
+        custom_arguments={},
+        except_augmentations={
+            A.MaskDropout,
+            A.CropNonEmptyMaskIfExists,
+            A.RandomCropNearBBox,
+            A.OverlayElements,
+            A.BBoxSafeRandomCrop,
+            A.RandomSizedBBoxSafeCrop,
+            A.ConstrainedCoarseDropout,
+            A.Mosaic,
+            A.BBoxSubsetSafeRandomCrop,
+        },
+    ),
+)
+def test_keypoints_xy_xyz(augmentation_cls, params):
+    """Test that xy and xyz keypoint formats produce identical results for x,y coordinates."""
+    seed = 137
+    aug1 = A.Compose([augmentation_cls(**params, p=1)], seed=seed, keypoint_params={"coord_format": "xy"})
+    aug2 = A.Compose([augmentation_cls(**params, p=1)], seed=seed, keypoint_params={"coord_format": "xyz"})
+
+    keypoints_xy = np.array(
+        [
+            [0, 0],  # corner
+            [50, 50],  # center-ish
+            [99, 99],  # corner
+            [25, 75],  # random point
+        ],
+    )
+
+    keypoints_xyz = np.column_stack(
+        [
+            keypoints_xy,
+            np.array([1.0, 2.0, 3.0, 4.0]),  # z coordinates
+        ],
+    )
+
+    # Transform both formats
+    base_img = np.zeros((100, 100, 3), dtype=np.uint8)
+    call_xy: dict[str, Any] = {"image": base_img, "keypoints": keypoints_xy}
+    call_xyz: dict[str, Any] = {"image": base_img, "keypoints": keypoints_xyz}
+    if augmentation_cls == A.CopyAndPaste:
+        call_xy["copy_paste_metadata"] = []
+        call_xyz["copy_paste_metadata"] = []
+    elif augmentation_cls == A.GuidedCoarseDropout:
+        call_xy["dropout_region"] = np.ones(base_img.shape[:2], dtype=np.uint8)
+        call_xyz["dropout_region"] = np.ones(base_img.shape[:2], dtype=np.uint8)
+
+    transformed_xy = aug1(**call_xy)["keypoints"]
+
+    transformed_xyz = aug2(**call_xyz)["keypoints"]
+
+    # Check that number of keypoints matches between formats
+    assert len(transformed_xy) == len(transformed_xyz), (
+        f"Different number of keypoints after transform: xy={len(transformed_xy)}, xyz={len(transformed_xyz)}"
+    )
+
+    if len(transformed_xyz) > 0:  # if any keypoints remain after transform
+        # Check that x,y coordinates match
+        np.testing.assert_allclose(
+            transformed_xy[:, :2],  # take only x,y from xy format
+            transformed_xyz[:, :2],  # take only x,y from xyz format
+            atol=1e-6,
+            err_msg=f"XY and XYZ formats produced different results for {augmentation_cls.__name__}",
+        )
+
+        # Check that z coordinates are a subset of original z coordinates
+        assert all(z in keypoints_xyz[:, 2] for z in transformed_xyz[:, 2]), (
+            f"Z coordinates after transform are not a subset of original z coordinates for {augmentation_cls.__name__}"
+        )
+
+
+@pytest.mark.parametrize(
+    ["padding", "initial_coords", "expected_coords"],
+    [
+        # Test single int padding - converts to (d,d, h,h, w,w)
+        (2, [1, 1, 1], [3, 3, 3]),  # becomes (2,2, 2,2, 2,2)
+        # Test symmetric padding (depth,height,width) - converts to (d,d, h,h, w,w)
+        ((2, 3, 4), [1, 1, 1], [5, 4, 3]),  # becomes (2,2, 3,3, 4,4)
+        # Test explicit padding (depth_front,depth_back, height_top,height_bottom, width_left,width_right)
+        ((2, 0, 3, 0, 4, 0), [1, 1, 1], [5, 4, 3]),  # pad only at start of each axis
+        ((0, 2, 0, 3, 0, 4), [1, 1, 1], [1, 1, 1]),  # pad only at end of each axis
+        ((1, 1, 2, 2, 3, 3), [1, 1, 1], [4, 3, 2]),  # equal padding on both sides
+    ],
+)
+def test_pad3d_keypoints(padding, initial_coords, expected_coords):
+    """Test that Pad3D correctly transforms keypoints.
+
+    The padding values are converted to 6-tuple format:
+    (depth_front, depth_back, height_top, height_bottom, width_left, width_right)
+
+    For keypoints in XYZ format:
+    - X coordinate is shifted by width_left
+    - Y coordinate is shifted by height_top
+    - Z coordinate is shifted by depth_front
+
+    Test cases verify:
+    1. Single int padding (same value for all sides)
+    2. Symmetric padding (different values per axis)
+    3. Explicit padding (different values for each side)
+    """
+    # Create test volume with a single marked voxel
+    volume = np.zeros((4, 4, 4), dtype=np.uint8)
+    x, y, z = initial_coords
+    volume[z, y, x] = 1  # Mark voxel in ZYX order
+
+    # Create keypoint at the same location
+    keypoints = np.array([[x, y, z]])  # XYZ order
+
+    transform = A.Compose([A.Pad3D(padding=padding, p=1.0)], seed=42, keypoint_params={"coord_format": "xyz"})
+    transformed = transform(volume=volume, keypoints=keypoints)
+
+    np.testing.assert_array_almost_equal(
+        transformed["keypoints"][0],
+        expected_coords,
+        err_msg=f"Padding {padding} failed to correctly shift keypoint from {initial_coords} to {expected_coords}",
+    )
+
+    # Verify volume transformation (optional)
+    transformed_volume = transformed["volume"]
+    x_new, y_new, z_new = expected_coords
+    assert transformed_volume[z_new, y_new, x_new] == 1, (
+        f"Expected marked voxel at {expected_coords}, but value is {transformed_volume[z_new, y_new, x_new]}"
+    )
+
+
+@pytest.mark.parametrize(
+    ["params", "volume_shape", "initial_coords", "expected_coords"],
+    [
+        # Test min_zyx only
+        (
+            {"min_zyx": (6, 8, 10)},  # force padding to reach minimum size
+            (4, 4, 4),  # initial volume shape
+            [1, 1, 1],  # initial keypoint
+            [4, 3, 2],  # expected keypoint after padding
+        ),
+        # Test pad_divisor_zyx only
+        (
+            {"pad_divisor_zyx": (4, 4, 4)},  # make dimensions divisible by 4
+            (5, 6, 7),  # initial volume shape
+            [2, 2, 2],  # initial keypoint
+            [2, 3, 3],  # expected keypoint after padding
+        ),
+        # Test both min_zyx and pad_divisor_zyx
+        (
+            {
+                "min_zyx": (8, 8, 8),  # minimum size
+                "pad_divisor_zyx": (4, 4, 4),  # also make divisible by 4
+            },
+            (5, 5, 5),  # initial volume shape
+            [2, 2, 2],  # initial keypoint
+            [3, 3, 3],  # expected keypoint after padding
+        ),
+    ],
+)
+def test_pad_if_needed3d_keypoints(params, volume_shape, initial_coords, expected_coords):
+    """Test that PadIfNeeded3D correctly transforms keypoints.
+
+    For volume shape (D,H,W) and keypoints in XYZ format:
+    - D (depth) padding shifts Z coordinate
+    - H (height) padding shifts Y coordinate
+    - W (width) padding shifts X coordinate
+
+    For center position:
+    - Padding is split evenly between start/end
+    - If odd padding, extra pixel goes to end
+    """
+    # Create test volume with a single marked voxel
+    volume = np.zeros(volume_shape, dtype=np.uint8)
+    x, y, z = initial_coords
+    volume[z, y, x] = 1  # Mark voxel in ZYX order
+
+    # Create keypoint at the same location
+    keypoints = np.array([[x, y, z]])  # XYZ order
+
+    transform = A.Compose(
+        [
+            A.PadIfNeeded3D(position="center", **params, p=1.0),
+        ],
+        keypoint_params={"coord_format": "xyz"},
+    )
+
+    transformed = transform(volume=volume, keypoints=keypoints)
+
+    np.testing.assert_array_almost_equal(
+        transformed["keypoints"][0],
+        expected_coords,
+        err_msg=(
+            f"PadIfNeeded3D with params {params} failed to correctly shift keypoint "
+            f"from {initial_coords} to {expected_coords}"
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ["volume_shape", "crop_size", "pad_if_needed", "initial_coords", "expected_coords"],
+    [
+        # Basic center crop (no padding needed)
+        (
+            (6, 6, 6),  # volume shape (ZYX)
+            (4, 4, 4),  # crop size (ZYX)
+            False,  # pad_if_needed
+            [2, 2, 2],  # initial keypoint (XYZ)
+            [1, 1, 1],  # expected keypoint after crop (XYZ)
+        ),
+        # Asymmetric volume shape
+        (
+            (8, 6, 4),  # volume shape (ZYX)
+            (4, 4, 2),  # crop size (ZYX)
+            False,  # pad_if_needed
+            [2, 2, 2],  # initial keypoint (XYZ)
+            [1, 1, 0],  # expected keypoint after crop (XYZ)
+        ),
+        # Crop with padding needed
+        (
+            (2, 2, 2),  # volume shape (ZYX)
+            (4, 4, 4),  # crop size (ZYX)
+            True,  # pad_if_needed
+            [1, 1, 1],  # initial keypoint (XYZ)
+            [2, 2, 2],  # expected keypoint after pad+crop (XYZ)
+        ),
+        # Edge case: exact size match
+        (
+            (4, 4, 4),  # volume shape (ZYX)
+            (4, 4, 4),  # crop size (ZYX)
+            False,  # pad_if_needed
+            [2, 2, 2],  # initial keypoint (XYZ)
+            [2, 2, 2],  # expected keypoint (no change) (XYZ)
+        ),
+        # Edge case: keypoint at volume border
+        (
+            (6, 6, 6),  # volume shape (ZYX)
+            (4, 4, 4),  # crop size (ZYX)
+            False,  # pad_if_needed
+            [0, 0, 0],  # initial keypoint (XYZ)
+            None,  # expected keypoint (should be cropped out)
+        ),
+    ],
+)
+def test_center_crop3d_keypoints(
+    volume_shape,
+    crop_size,
+    pad_if_needed,
+    initial_coords,
+    expected_coords,
+):
+    """Test CenterCrop3D transform with keypoints.
+
+    Tests:
+    1. Basic center cropping
+    2. Asymmetric volume shapes
+    3. Padding when needed
+    4. Edge cases:
+       - Exact size match
+       - Keypoints at volume borders
+       - Keypoints that get cropped out
+    """
+    volume = np.zeros(volume_shape, dtype=np.uint8)
+
+    x, y, z = initial_coords
+    keypoints = np.array([[x, y, z]])  # XYZ format
+
+    # Mark keypoint in volume for visual verification
+    volume[z, y, x] = 1
+
+    transform = A.Compose(
+        [
+            A.CenterCrop3D(
+                size=crop_size,
+                pad_if_needed=pad_if_needed,
+                p=1.0,
+            ),
+        ],
+        keypoint_params={"coord_format": "xyz"},
+    )
+
+    transformed = transform(volume=volume, keypoints=keypoints)
+
+    if expected_coords is None:
+        # Keypoint should be cropped out
+        assert len(transformed["keypoints"]) == 0, "Expected keypoint to be cropped out"
+    else:
+        # Verify keypoint position
+        np.testing.assert_array_almost_equal(
+            transformed["keypoints"][0],
+            expected_coords,
+            err_msg=(
+                f"CenterCrop3D failed: keypoint at {initial_coords} "
+                f"should move to {expected_coords}, but got {transformed['keypoints'][0]}"
+            ),
+        )
+
+        # Verify volume dimensions
+        assert transformed["volume"].shape[:3] == crop_size, (
+            f"Expected volume shape {crop_size}, got {transformed['volume'].shape[:3]}"
+        )
+
+        # Verify keypoint is still marked in volume
+        x_new, y_new, z_new = expected_coords
+        assert transformed["volume"][z_new, y_new, x_new] == 1, f"Expected marked voxel at {expected_coords}"
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_3d_transform_params(
+        custom_arguments={
+            A.PadIfNeeded3D: {"min_zyx": (8, 8, 8), "position": "center"},
+            A.Pad3D: {"padding": 2},
+            A.RandomCrop3D: {"size": (4, 4, 4)},
+            A.CenterCrop3D: {"size": (4, 4, 4)},
+            A.CubicSymmetry: {},
+            A.Affine3D: {
+                "rotate_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (90.0, 90.0)},
+                "scale_range": {"x": (1.0, 1.0), "y": (1.0, 1.0), "z": (1.0, 1.0)},
+                "translate_percent_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
+                "interpolation": cv2.INTER_NEAREST,
+            },
+            A.Resize3D: {"size": (12, 12, 12), "interpolation": cv2.INTER_NEAREST},
+            A.RandomResizedCrop3D: {
+                "size": (6, 6, 6),
+                "scale": (1.0, 1.0),
+                "ratio": 1.0,
+                "interpolation": cv2.INTER_NEAREST,
+            },
+        },
+        except_augmentations={
+            A.CoarseDropout3D,
+            A.Anisotropy3D,
+            A.ElasticTransform3D,
+        },
+    ),
+)
+def test_3d_transforms_keypoint_positions(augmentation_cls, params):
+    """Test that keypoints match marked points in transformed volume."""
+    # Create test volume with marked points
+    volume = np.zeros((6, 6, 6), dtype=np.uint8)
+    keypoints = np.array(
+        [
+            [1, 1, 1],  # XYZ coordinates
+            [1, 3, 1],
+            [3, 1, 3],
+            [2, 2, 2],
+        ],
+        dtype=np.float32,
+    )
+
+    # Mark points in volume (converting from XYZ to ZYX)
+    for x, y, z in keypoints:
+        volume[int(z), int(y), int(x)] = 1
+
+    transform = A.Compose(
+        [
+            augmentation_cls(p=1, **params),
+        ],
+        keypoint_params={"coord_format": "xyz"},
+        seed=137,
+    )
+
+    transformed = transform(volume=volume, keypoints=keypoints)
+
+    # Verify each transformed keypoint matches a marked point in volume
+    for x, y, z in transformed["keypoints"]:
+        assert transformed["volume"][int(z), int(y), int(x)] == 1, (
+            f"Keypoint at ({x}, {y}, {z}) should match marked point in volume "
+            f"after {augmentation_cls.__name__} transform"
+        )
+
+
+def test_grid_shuffle_3d_basic():
+    """Test basic functionality of GridShuffle3D"""
+    volume = np.random.randint(0, 256, (10, 100, 100), dtype=np.uint8)
+    mask3d = np.random.randint(0, 2, (10, 100, 100), dtype=np.uint8)
+
+    transform = A.Compose(
+        [
+            A.GridShuffle3D(grid_zyx=(2, 2, 2), p=1.0),
+        ],
+        seed=137,
+        strict=True,
+    )
+
+    transformed = transform(volume=volume, mask3d=mask3d)
+
+    # Check that shape is preserved
+    assert transformed["volume"].shape == volume.shape
+    assert transformed["mask3d"].shape == mask3d.shape
+
+    # Check that content is shuffled (not equal to original)
+    assert not np.array_equal(transformed["volume"], volume)
+    assert not np.array_equal(transformed["mask3d"], mask3d)
+
+    # Check that total sum is preserved (no data loss)
+    np.testing.assert_allclose(
+        transformed["volume"].sum(),
+        volume.sum(),
+        rtol=1e-5,
+    )
+    np.testing.assert_allclose(
+        transformed["mask3d"].sum(),
+        mask3d.sum(),
+        rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    "grid_zyx",
+    [
+        (2, 2, 2),
+        (1, 3, 3),
+        (3, 1, 3),
+        (3, 3, 1),
+        (2, 3, 4),
+    ],
+)
+def test_grid_shuffle_3d_various_grids(grid_zyx):
+    """Test GridShuffle3D with various grid configurations"""
+    volume = np.random.randint(0, 256, (12, 96, 96), dtype=np.uint8)
+
+    transform = A.GridShuffle3D(grid_zyx=grid_zyx, p=1.0)
+    transformed = transform(volume=volume)
+
+    assert transformed["volume"].shape == volume.shape
+
+    # Check content preservation
+    np.testing.assert_allclose(
+        transformed["volume"].sum(),
+        volume.sum(),
+        rtol=1e-5,
+    )
+
+
+def test_grid_shuffle_3d_with_keypoints():
+    """Test GridShuffle3D with keypoints"""
+    volume = np.random.randint(0, 256, (10, 100, 100), dtype=np.uint8)
+    keypoints = np.array(
+        [[20, 30, 2], [60, 70, 7], [10, 10, 1], [80, 90, 8]],
+        dtype=np.float32,
+    )
+    keypoint_labels = [0, 1, 2, 3]
+
+    transform = A.Compose(
+        [
+            A.GridShuffle3D(grid_zyx=(2, 2, 2), p=1.0),
+        ],
+        keypoint_params=A.KeypointParams(coord_format="xyz"),
+        seed=137,
+    )
+
+    # Use seed for reproducibility
+    transformed = transform(
+        volume=volume,
+        keypoints=keypoints,
+        keypoint_labels=keypoint_labels,
+    )
+
+    # Check that keypoints are transformed
+    assert not np.array_equal(transformed["keypoints"], keypoints)
+
+    # Check that all keypoints are still within bounds
+    for kp in transformed["keypoints"]:
+        assert 0 <= kp[0] < 100  # x
+        assert 0 <= kp[1] < 100  # y
+        assert 0 <= kp[2] < 10  # z
+
+    # Check that labels are passed through (no label swapping for grid shuffle)
+    assert transformed["keypoint_labels"] == keypoint_labels
+
+
+def test_grid_shuffle_3d_consistency():
+    """Test that GridShuffle3D applies the same shuffle to all targets"""
+    # Create a volume with distinct patterns in each grid cell
+    volume = np.zeros((8, 80, 80), dtype=np.uint8)
+
+    # Fill different grid cells with different values
+    # (assuming 2x2x2 grid = 8 cells)
+    volume[:4, :40, :40] = 1  # cell (0,0,0)
+    volume[:4, :40, 40:] = 2  # cell (0,0,1)
+    volume[:4, 40:, :40] = 3  # cell (0,1,0)
+    volume[:4, 40:, 40:] = 4  # cell (0,1,1)
+    volume[4:, :40, :40] = 5  # cell (1,0,0)
+    volume[4:, :40, 40:] = 6  # cell (1,0,1)
+    volume[4:, 40:, :40] = 7  # cell (1,1,0)
+    volume[4:, 40:, 40:] = 8  # cell (1,1,1)
+
+    # Use same pattern for mask
+    mask3d = volume.copy()
+
+    transform = A.Compose(
+        [
+            A.GridShuffle3D(grid_zyx=(2, 2, 2), p=1.0),
+        ],
+        seed=137,
+    )
+
+    transformed = transform(volume=volume, mask3d=mask3d)
+
+    # Check that volume and mask received the same shuffle
+    np.testing.assert_array_equal(
+        transformed["volume"],
+        transformed["mask3d"],
+    )
+
+
+def test_grid_shuffle_3d_probability():
+    """Test that GridShuffle3D respects probability parameter"""
+    volume = np.random.randint(0, 256, (10, 100, 100), dtype=np.uint8)
+
+    # With p=0, should not transform
+    transform = A.GridShuffle3D(grid_zyx=(2, 2, 2), p=0.0)
+    transformed = transform(volume=volume)
+    np.testing.assert_array_equal(transformed["volume"], volume)
+
+    # With p=1, should always transform
+    transform = A.GridShuffle3D(grid_zyx=(2, 2, 2), p=1.0)
+
+    # Run multiple times to ensure it transforms
+    num_transforms = 10
+    transform_count = 0
+    for _ in range(num_transforms):
+        transformed = transform(volume=volume)
+        if not np.array_equal(transformed["volume"], volume):
+            transform_count += 1
+
+    # Should transform at least once (very high probability)
+    assert transform_count > 0
+
+
+@pytest.mark.parametrize("axis_pair", [(0, 1), (0, 2), (1, 2)])
+@pytest.mark.parametrize("group_element", ["e", "r90", "r180", "r270"])
+def test_random_rotate90_3d_rotates_volume_mask_and_keypoints(axis_pair, group_element):
+    volume = np.arange(3 * 4 * 5 * 2, dtype=np.uint8).reshape(3, 4, 5, 2)
+    mask3d = (volume[..., 0] % 2).astype(np.uint8)
+    keypoints = np.array([[1, 1, 0], [3, 2, 1], [4, 3, 2]], dtype=np.float32)
+    keypoint_labels = [7, 9, 11]
+    augmentation = A.RandomRotate90_3D(
+        axis_pair=axis_pair,
+        group_element=group_element,
+        p=1.0,
+    )
+    compose = A.Compose(
+        [augmentation],
+        keypoint_params=A.KeypointParams(coord_format="xyz", label_fields=["keypoint_labels"]),
+        strict=True,
+    )
+
+    result = compose(
+        volume=volume,
+        mask3d=mask3d,
+        keypoints=keypoints,
+        keypoint_labels=keypoint_labels,
+    )
+
+    rotation_count = {"e": 0, "r90": 1, "r180": 2, "r270": 3}[group_element]
+    np.testing.assert_array_equal(result["volume"], np.rot90(volume, k=rotation_count, axes=axis_pair))
+    np.testing.assert_array_equal(result["mask3d"], np.rot90(mask3d, k=rotation_count, axes=axis_pair))
+    assert result["volume"].dtype == volume.dtype
+    assert result["mask3d"].dtype == mask3d.dtype
+    assert result["keypoint_labels"] == keypoint_labels
+
+    restored = A.Compose(
+        [augmentation.inverse()],
+        keypoint_params=A.KeypointParams(coord_format="xyz", label_fields=["keypoint_labels"]),
+        strict=True,
+    )(**result)
+    np.testing.assert_array_equal(restored["volume"], volume)
+    np.testing.assert_array_equal(restored["mask3d"], mask3d)
+    np.testing.assert_array_equal(restored["keypoints"], keypoints)
+
+
+def test_random_rotate90_3d_seeded_replay_and_applied_configuration():
+    volume = np.arange(3 * 4 * 5, dtype=np.uint8).reshape(3, 4, 5, 1)
+    pipeline = A.Compose(
+        [A.RandomRotate90_3D(axis_pairs=((0, 2),), p=1.0)],
+        save_applied_params=True,
+        seed=137,
+        strict=True,
+    )
+
+    result = pipeline(volume=volume)
+    replay = A.Compose.from_applied_transforms(result["applied_transforms"], strict=True)
+    replayed = replay(volume=volume)
+
+    np.testing.assert_array_equal(replayed["volume"], result["volume"])
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"axis_pairs": ()},
+        {"axis_pairs": ((0, 0),)},
+        {"axis_pairs": ((0, 2), (0, 2))},
+        {"group_element": "r45"},
+    ],
+)
+def test_random_rotate90_3d_rejects_invalid_configuration(kwargs):
+    with pytest.raises(ValueError):
+        A.RandomRotate90_3D(**kwargs)
+
+
+def test_random_rotate90_3d_random_mode_cannot_be_inverted():
+    with pytest.raises(ValueError, match="random mode"):
+        A.RandomRotate90_3D().inverse()
+
+
+def test_flip3d_reflects_volume_mask_and_keypoints_without_reordering_axes():
+    volume = np.arange(3 * 4 * 5 * 2, dtype=np.uint8).reshape(3, 4, 5, 2)
+    mask3d = (volume[..., 0] % 2).astype(np.uint8)
+    keypoints = np.array([[1, 1, 0], [3, 2, 1], [4, 3, 2]], dtype=np.float32)
+    keypoint_labels = [7, 9, 11]
+    transform = A.Flip3D(flip_axes=(0, 2), p=1.0)
+    compose = A.Compose(
+        [transform],
+        keypoint_params=A.KeypointParams(coord_format="xyz", label_fields=["keypoint_labels"]),
+        strict=True,
+    )
+
+    result = compose(
+        volume=volume,
+        mask3d=mask3d,
+        keypoints=keypoints,
+        keypoint_labels=keypoint_labels,
+    )
+
+    np.testing.assert_array_equal(result["volume"], np.flip(volume, axis=(0, 2)))
+    np.testing.assert_array_equal(result["mask3d"], np.flip(mask3d, axis=(0, 2)))
+    np.testing.assert_array_equal(result["keypoints"], np.array([[3, 1, 2], [1, 2, 1], [0, 3, 0]], dtype=np.float32))
+    assert result["volume"].shape == volume.shape
+    assert result["mask3d"].shape == mask3d.shape
+    assert result["volume"].dtype == volume.dtype
+    assert result["mask3d"].dtype == mask3d.dtype
+    assert result["keypoint_labels"] == keypoint_labels
+
+    restored = A.Compose(
+        [transform.inverse()],
+        keypoint_params=A.KeypointParams(coord_format="xyz", label_fields=["keypoint_labels"]),
+        strict=True,
+    )(**result)
+    np.testing.assert_array_equal(restored["volume"], volume)
+    np.testing.assert_array_equal(restored["mask3d"], mask3d)
+    np.testing.assert_array_equal(restored["keypoints"], keypoints)
+
+
+@pytest.mark.parametrize(
+    ("flip_axes", "expected_keypoints"),
+    [
+        ((0,), np.array([[1, 1, 1], [3, 2, 0]], dtype=np.float32)),
+        ((1,), np.array([[1, 1, 0], [3, 0, 1]], dtype=np.float32)),
+        ((2,), np.array([[3, 1, 0], [1, 2, 1]], dtype=np.float32)),
+        ((0, 1, 2), np.array([[3, 1, 1], [1, 0, 0]], dtype=np.float32)),
+    ],
+)
+def test_flip3d_odd_reflections_remap_keypoint_labels_without_reordering_rows(
+    flip_axes: tuple[int, ...],
+    expected_keypoints: np.ndarray,
+) -> None:
+    volume = np.zeros((2, 3, 5, 1), dtype=np.float32)
+    keypoints = np.array([[1, 1, 0], [3, 2, 1]], dtype=np.float32)
+    side = [2, 3]
+    transform = A.Compose(
+        [A.Flip3D(flip_axes=flip_axes, p=1.0)],
+        keypoint_params=A.KeypointParams(
+            coord_format="xyz",
+            label_fields=["side"],
+            label_mapping={"Flip3D": {"side": {2: 3, 3: 2}}},
+        ),
+        strict=True,
+        telemetry=False,
+    )
+
+    result = transform(volume=volume, keypoints=keypoints, side=side)
+
+    np.testing.assert_array_equal(result["keypoints"], expected_keypoints)
+    assert result["side"] == [3, 2]
+
+
+@pytest.mark.parametrize(
+    ("index", "expected_keypoints", "expected_side"),
+    [
+        (0, np.array([[1, 1, 0], [3, 2, 1]], dtype=np.float32), [2, 3]),
+        (24, np.array([[3, 1, 0], [1, 2, 1]], dtype=np.float32), [3, 2]),
+    ],
+)
+def test_cubic_symmetry_remaps_keypoint_labels_without_reordering_transformed_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    index: int,
+    expected_keypoints: np.ndarray,
+    expected_side: list[int],
+) -> None:
+    """A rotoreflection reassigns 3D semantic labels while every transformed keypoint stays in its own row."""
+    volume = np.zeros((2, 3, 5, 1), dtype=np.float32)
+    keypoints = np.array([[1, 1, 0], [3, 2, 1]], dtype=np.float32)
+    side = [2, 3]
+
+    def fixed_index(
+        self: A.CubicSymmetry,
+        params: dict[str, Any],
+        data: dict[str, Any],
+        targets: TargetSet,
+        sampling: Any,
+    ) -> SampledParams:
+        del self, params, targets, sampling
+        return SampledParams(params={"index": index, "volume_shape": data["volume"].shape})
+
+    monkeypatch.setattr(A.CubicSymmetry, "sample_parameters", fixed_index)
+    result = A.Compose(
+        [A.CubicSymmetry(p=1.0)],
+        keypoint_params=A.KeypointParams(
+            coord_format="xyz",
+            label_fields=["side"],
+            label_mapping={"CubicSymmetry": {"side": {2: 3, 3: 2}}},
+        ),
+        strict=True,
+        telemetry=False,
+    )(volume=volume, keypoints=keypoints, side=side)
+
+    np.testing.assert_array_equal(result["keypoints"], expected_keypoints)
+    assert result["side"] == expected_side
+
+
+@pytest.mark.parametrize(
+    ("label_mapping", "expected_side", "expected_view"),
+    [
+        ({"Flip3D": {"side": {2: 3, 3: 2}}}, [3, 2], [4, 5]),
+        ({"Flip3D": {"view": {4: 5, 5: 4}}}, [2, 3], [5, 4]),
+    ],
+)
+def test_flip3d_keypoint_label_mapping_handles_multiple_fields_independently(
+    label_mapping: dict[str, dict[str, dict[int, int]]],
+    expected_side: list[int],
+    expected_view: list[int],
+) -> None:
+    volume = np.zeros((2, 3, 5, 1), dtype=np.float32)
+    keypoints = np.array([[1, 1, 0], [3, 2, 1]], dtype=np.float32)
+    side = [2, 3]
+    view = [4, 5]
+    transform = A.Compose(
+        [A.Flip3D(flip_axes=(2,), p=1.0)],
+        keypoint_params=A.KeypointParams(
+            coord_format="xyz",
+            label_fields=["side", "view"],
+            label_mapping=label_mapping,
+        ),
+        strict=True,
+        telemetry=False,
+    )
+
+    result = transform(volume=volume, keypoints=keypoints, side=side, view=view)
+
+    np.testing.assert_array_equal(result["keypoints"], np.array([[3, 1, 0], [1, 2, 1]], dtype=np.float32))
+    assert result["side"] == expected_side
+    assert result["view"] == expected_view
+
+
+@pytest.mark.parametrize("flip_axes", [(0, 1), (0, 2), (1, 2)])
+def test_flip3d_even_reflections_preserve_keypoint_labels(flip_axes: tuple[int, ...]) -> None:
+    volume = np.zeros((2, 3, 5, 1), dtype=np.float32)
+    keypoints = np.array([[1, 1, 0], [3, 2, 1]], dtype=np.float32)
+    side = [2, 3]
+    transform = A.Compose(
+        [A.Flip3D(flip_axes=flip_axes, p=1.0)],
+        keypoint_params=A.KeypointParams(
+            coord_format="xyz",
+            label_fields=["side"],
+            label_mapping={"Flip3D": {"side": {2: 3, 3: 2}}},
+        ),
+        strict=True,
+        telemetry=False,
+    )
+
+    result = transform(volume=volume, keypoints=keypoints, side=side)
+
+    assert result["side"] == side
+
+
+def test_flip3d_seeded_replay_records_realized_axes():
+    volume = np.arange(3 * 4 * 5, dtype=np.uint8).reshape(3, 4, 5, 1)
+    pipeline = A.Compose(
+        [A.Flip3D(axes=(0, 2), p=1.0)],
+        save_applied_params=True,
+        seed=137,
+        strict=True,
+    )
+
+    result = pipeline(volume=volume)
+    replay = A.Compose.from_applied_transforms(result["applied_transforms"], strict=True)
+    replayed = replay(volume=volume)
+
+    np.testing.assert_array_equal(replayed["volume"], result["volume"])
+
+
+def test_flip3d_random_mode_samples_the_full_reflection_group() -> None:
+    transform = A.Flip3D(axes=(0, 2), p=1.0)
+    transform.set_random_seed(137)
+    volume = np.zeros((2, 3, 5, 1), dtype=np.uint8)
+
+    sampled_axes = {
+        transform.sample_parameters(
+            *make_sampling_args(transform, {"volume": volume}),
+            SamplingContext.from_owner(transform, {}),
+        ).params["flip_axes"]
+        for _ in range(64)
+    }
+
+    assert sampled_axes == {(), (0,), (2,), (0, 2)}
+
+
+def test_flip3d_fixed_identity_preserves_targets_and_is_self_inverse() -> None:
+    volume = np.arange(2 * 3 * 5, dtype=np.uint8).reshape(2, 3, 5, 1)
+    mask3d = (volume[..., 0] % 2).astype(np.uint8)
+    keypoints = np.array([[1, 1, 0], [3, 2, 1]], dtype=np.float32)
+    transform = A.Flip3D(flip_axes=(), p=1.0)
+    compose = A.Compose(
+        [transform],
+        keypoint_params=A.KeypointParams(coord_format="xyz"),
+        save_applied_params=True,
+        strict=True,
+    )
+
+    result = compose(volume=volume, mask3d=mask3d, keypoints=keypoints)
+    restored = A.Compose([transform.inverse()], keypoint_params=A.KeypointParams(coord_format="xyz"), strict=True)(
+        **result,
+    )
+
+    np.testing.assert_array_equal(result["volume"], volume)
+    np.testing.assert_array_equal(result["mask3d"], mask3d)
+    np.testing.assert_array_equal(result["keypoints"], keypoints)
+    assert result["applied_transforms"][0][1]["flip_axes"] == ()
+    np.testing.assert_array_equal(restored["volume"], volume)
+    np.testing.assert_array_equal(restored["mask3d"], mask3d)
+    np.testing.assert_array_equal(restored["keypoints"], keypoints)
+
+    serialized = A.to_dict(compose)
+    assert serialized["transform"]["transforms"][0]["flip_axes"] == []
+    deserialized = A.from_dict(serialized)
+
+    np.testing.assert_array_equal(deserialized(volume=volume)["volume"], volume)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"axes": ()},
+        {"axes": (0, 0)},
+        {"axes": (0,), "flip_axes": (1,)},
+        {"flip_axes": (0, 0)},
+    ],
+)
+def test_flip3d_rejects_invalid_configuration(kwargs):
+    with pytest.raises(ValueError):
+        A.Flip3D(**kwargs)
+
+
+def test_flip3d_random_mode_cannot_be_inverted():
+    with pytest.raises(ValueError, match="random mode"):
+        A.Flip3D().inverse()

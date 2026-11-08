@@ -1,0 +1,1595 @@
+"""Typed source of truth for shared transform contract cases."""
+
+from __future__ import annotations
+
+import copy
+import inspect
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any
+
+import cv2
+import numpy as np
+
+import albumentations as A
+from tests.helpers.applied_config import ReplayProfile
+from tests.helpers.contract_data import (
+    ContractContextFactory,
+    ContractDataFactory,
+    make_binary_region_context,
+    make_copy_and_paste_context,
+    make_crop_near_bbox_context,
+    make_empty_context,
+    make_float_image_data,
+    make_grayscale_image_data,
+    make_hbb_data,
+    make_image_data,
+    make_mask_data,
+    make_mosaic_context,
+    make_overlay_context,
+    make_reference_context,
+    make_target_image_batch_data,
+    make_volume_data,
+)
+
+
+@dataclass(frozen=True)
+class TransformContractCase:
+    """One public constructor mode and the data needed to replay it."""
+
+    case_id: str
+    transform_cls: type[A.BasicTransform]
+    init_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    primary_data_factory: ContractDataFactory = make_image_data
+    context_factory: ContractContextFactory = make_empty_context
+    primary_compose_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    replay_profile: ReplayProfile = ReplayProfile.RUNNABLE
+    metadata_keys: frozenset[str] = frozenset()
+    required_targets: frozenset[str] = frozenset()
+    seeds: tuple[int, ...] = (137,)
+    tensor_uint8_atol: int = 0
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", self.case_id):
+            raise ValueError(f"Invalid transform contract case_id: {self.case_id!r}")
+        forbidden = {"p", "strict"} & set(self.init_kwargs)
+        if forbidden:
+            raise ValueError(f"{self.case_id}: harness-owned arguments are forbidden: {sorted(forbidden)}")
+        signature = inspect.signature(self.transform_cls.__init__)
+        public_parameters = {
+            name
+            for name, parameter in signature.parameters.items()
+            if name != "self"
+            and parameter.kind in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+        }
+        unknown = set(self.init_kwargs) - public_parameters
+        if unknown:
+            raise ValueError(f"{self.case_id}: unknown public constructor arguments: {sorted(unknown)}")
+        if not self.seeds:
+            raise ValueError(f"{self.case_id}: at least one deterministic seed is required")
+        object.__setattr__(self, "init_kwargs", MappingProxyType(copy.deepcopy(dict(self.init_kwargs))))
+        object.__setattr__(
+            self,
+            "primary_compose_kwargs",
+            MappingProxyType(copy.deepcopy(dict(self.primary_compose_kwargs))),
+        )
+
+    def make_data(
+        self,
+        rng: np.random.Generator,
+        data_factory: ContractDataFactory | None = None,
+    ) -> dict[str, Any]:
+        """Build fresh targets and merge transform-specific context without collisions."""
+        data = (data_factory or self.primary_data_factory)(rng)
+        context = self.context_factory(rng, data)
+        collisions = set(data) & set(context)
+        if collisions:
+            raise ValueError(f"{self.case_id}: context collides with targets: {sorted(collisions)}")
+        data.update(context)
+        return data
+
+
+_BASE_CASE_SPECS: list[list[Any]] = [
+    [A.UniformTemporalSubsample, {"num_frames": 3}],
+    [
+        A.ImageCompression,
+        {
+            "quality_range": (10, 80),
+            "compression_type": "webp",
+        },
+    ],
+    [
+        A.HueSaturationValue,
+        {"hue_shift_range": (-70, 70), "sat_shift_range": (-95, 95), "val_shift_range": (-55, 55)},
+    ],
+    [A.RGBShift, {"r_shift_range": (-70, 70), "g_shift_range": (-80, 80), "b_shift_range": (-40, 40)}],
+    [A.RandomBrightnessContrast, {"brightness_range": (-0.5, 0.5), "contrast_range": (-0.8, 0.8)}],
+    [A.ExposureMatching, {"target_mean_range": (0.2, 0.6), "gain_range": (0.5, 3.0)}],
+    [A.Blur, {"blur_range": (3, 5)}],
+    [A.MotionBlur, {"blur_range": (3, 5)}],
+    [A.MedianBlur, {"blur_range": (3, 5)}],
+    [A.ModeFilter, {"kernel_range": (3, 5)}],
+    [A.GaussianBlur, {"blur_range": (3, 5)}],
+    [
+        A.GaussNoise,
+        {"std_range": (0.2, 0.44), "mean_range": (0.0, 0.0), "per_channel": False},
+    ],
+    [A.CLAHE, {"clip_range": (1, 2), "tile_grid_size": (12, 12)}],
+    [A.RandomGamma, {"gamma_range": (10, 90)}],
+    [
+        A.CoarseDropout,
+        [
+            {
+                "num_holes_range": (2, 5),
+                "hole_height_range": (3, 4),
+                "hole_width_range": (4, 6),
+            },
+            {
+                "num_holes_range": (2, 5),
+                "hole_height_range": (0.1, 0.2),
+                "hole_width_range": (0.2, 0.3),
+            },
+        ],
+    ],
+    [
+        A.GuidedCoarseDropout,
+        {
+            "num_holes_range": (3, 5),
+            "hole_height_range": (0.05, 0.15),
+            "hole_width_range": (0.05, 0.15),
+            "fill_mask": 0,
+            "protected_bbox_labels": [1],
+            "protection_margin": 0.1,
+        },
+    ],
+    [
+        A.RandomSnow,
+        {"snow_point_range": (0.2, 0.4), "brightness_coeff": 4},
+    ],
+    [
+        A.RandomRain,
+        {
+            "slant_range": (-5, 5),
+            "drop_length": 15,
+            "drop_width": 2,
+            "drop_color": (100, 100, 100),
+            "blur_value": 3,
+            "brightness_coefficient": 0.5,
+            "rain_type": "heavy",
+        },
+    ],
+    [A.RandomFog, {"fog_coef_range": (0.2, 0.8), "alpha_coef": 0.11}],
+    [
+        A.RandomSunFlare,
+        {
+            "flare_roi": (0.1, 0.1, 0.9, 0.6),
+            "angle_range": (0.1, 0.95),
+            "num_flare_circles_range": (7, 11),
+            "src_radius": 300,
+            "src_color": (200, 200, 200),
+        },
+    ],
+    [
+        A.RandomGravel,
+        {
+            "gravel_roi": (0.1, 0.4, 0.9, 0.9),
+            "number_of_patches": 2,
+        },
+    ],
+    [
+        A.RandomShadow,
+        {
+            "shadow_roi": (0.1, 0.4, 0.9, 0.9),
+            "num_shadows_range": (2, 4),
+            "shadow_dimension": 8,
+        },
+    ],
+    [
+        A.PadIfNeeded,
+        {
+            "min_height": 512,
+            "min_width": 512,
+            "border_mode": cv2.BORDER_CONSTANT,
+            "fill": (10, 10, 10),
+        },
+    ],
+    [
+        A.Rotate,
+        {
+            "angle_range": (-120, 120),
+            "interpolation": cv2.INTER_CUBIC,
+            "border_mode": cv2.BORDER_CONSTANT,
+            "fill": (10, 10, 10),
+            "crop_border": False,
+        },
+    ],
+    [
+        A.SafeRotate,
+        {
+            "angle_range": (-120, 120),
+            "interpolation": cv2.INTER_CUBIC,
+            "border_mode": cv2.BORDER_CONSTANT,
+            "fill": 10,
+        },
+    ],
+    [
+        A.ShiftScaleRotate,
+        [
+            {
+                "shift_range": (-0.2, 0.2),
+                "scale_range": (-0.2, 0.2),
+                "rotate_range": (-70, 70),
+                "interpolation": cv2.INTER_CUBIC,
+                "border_mode": cv2.BORDER_CONSTANT,
+                "fill": 10,
+            },
+            {
+                "shift_range_x": (-0.3, 0.3),
+                "shift_range_y": (-0.4, 0.4),
+                "scale_range": (-0.2, 0.2),
+                "rotate_range": (-70, 70),
+                "interpolation": cv2.INTER_CUBIC,
+                "border_mode": cv2.BORDER_CONSTANT,
+                "fill": 10,
+            },
+        ],
+    ],
+    [
+        A.OpticalDistortion,
+        {
+            "distort_range": (-0.2, 0.2),
+            "interpolation": cv2.INTER_AREA,
+        },
+    ],
+    [
+        A.GridDistortion,
+        {
+            "num_steps": 10,
+            "distort_range": (-0.5, 0.5),
+            "interpolation": cv2.INTER_CUBIC,
+        },
+    ],
+    [
+        A.ElasticTransform,
+        {
+            "displacement_range": (0.03, 0.05),
+            "control_grid_shape": (4, 4),
+            "interpolation": cv2.INTER_CUBIC,
+        },
+    ],
+    [A.PixelSpread, {"radius": 3}],
+    [A.CenterCrop, {"height": 90, "width": 95}],
+    [A.RandomCrop, {"height": 90, "width": 95}],
+    [A.AtLeastOneBBoxRandomCrop, {"height": 90, "width": 95}],
+    [A.CropNonEmptyMaskIfExists, {"height": 10, "width": 10}],
+    [A.RandomSizedCrop, {"min_max_height": (90, 100), "size": (90, 90)}],
+    [A.Crop, {"x_max": 64, "y_max": 64}],
+    [A.ToFloat, {"max_value": 16536}],
+    [
+        A.Normalize,
+        {
+            "mean": (0.385, 0.356, 0.306),
+            "std": (0.129, 0.124, 0.125),
+            "max_pixel_value": 100.0,
+        },
+    ],
+    [A.RandomScale, {"scale_range": (-0.2, 0.2), "interpolation": cv2.INTER_CUBIC}],
+    [A.Resize, {"height": 64, "width": 64}],
+    [A.SmallestMaxSize, {"max_size": 64, "interpolation": cv2.INTER_AREA}],
+    [A.LongestMaxSize, [{"max_size": 128}, {"max_size_hw": (127, 126)}]],
+    [
+        A.LetterBox,
+        [
+            {"size": (128, 128)},
+            {"size": (128, 64), "position": "top_left"},
+            {"size": (64, 128), "position": "bottom_right"},
+        ],
+    ],
+    [A.RandomGridShuffle, {"grid": (4, 4)}],
+    [A.Solarize, {"threshold_range": [0.5, 0.5]}],
+    [A.Posterize, {"num_bits": (3, 5)}],
+    [A.Equalize, {"mode": "pil", "by_channels": False}],
+    [
+        A.MultiplicativeNoise,
+        {"multiplier": (0.7, 2.3), "per_channel": True, "elementwise": True},
+    ],
+    [
+        A.ColorJitter,
+        {
+            "brightness_range": [0.2, 0.3],
+            "contrast_range": [0.7, 0.9],
+            "saturation_range": [1.2, 1.7],
+            "hue_range": [-0.2, 0.1],
+        },
+    ],
+    [
+        A.PhotoMetricDistort,
+        {
+            "brightness_range": (0.875, 1.125),
+            "contrast_range": (0.5, 1.5),
+            "saturation_range": (0.5, 1.5),
+            "hue_range": (-0.05, 0.05),
+            "distort_p": 0.5,
+        },
+    ],
+    [
+        A.Perspective,
+        {
+            "scale": (0.05, 0.5),
+            "keep_size": True,
+            "border_mode": cv2.BORDER_REFLECT_101,
+            "fill": 10,
+            "fill_mask": 100,
+            "fit_output": True,
+            "interpolation": cv2.INTER_CUBIC,
+        },
+    ],
+    [A.Sharpen, {"alpha_range": [0.2, 0.5], "lightness_range": [0.5, 1.0]}],
+    [A.Emboss, {"alpha_range": [0.2, 0.5], "strength_range": [0.5, 1.0]}],
+    [A.Enhance, {"mode": "edge", "alpha_range": (0.5, 1.0)}],
+    [A.Enhance, {"mode": "detail", "alpha_range": (0.5, 1.0)}],
+    [A.RandomToneCurve, {"scale": 0.2, "per_channel": False}],
+    [A.RandomToneCurve, {"scale": 0.3, "per_channel": True}],
+    [
+        A.CropAndPad,
+        {
+            "px": 10,
+            "keep_size": False,
+            "sample_independently": False,
+            "interpolation": cv2.INTER_CUBIC,
+            "fill_mask": [10, 20, 30],
+            "fill": [11, 12, 13],
+            "border_mode": cv2.BORDER_REFLECT101,
+        },
+    ],
+    [
+        A.CropAndPad,
+        {"px_choices": (-5, -10, -15), "keep_size": False},
+    ],
+    [
+        A.CropAndPad,
+        {"percent_choices": (-0.05, -0.10), "keep_size": False},
+    ],
+    [
+        A.Superpixels,
+        {
+            "p_replace_range": (0.5, 0.7),
+            "n_segments_range": (20, 30),
+            "max_size": 25,
+            "interpolation": cv2.INTER_CUBIC,
+        },
+    ],
+    [
+        A.Affine,
+        [
+            {
+                "scale": (0.5, 0.5),
+                "translate_percent": (0.1, 0.1),
+                "translate_px": None,
+                "rotate": (33, 33),
+                "shear": (21, 21),
+                "interpolation": cv2.INTER_CUBIC,
+                "fill": 25,
+                "fill_mask": 0,
+                "border_mode": cv2.BORDER_CONSTANT,
+                "fit_output": False,
+            },
+            {
+                "scale": {"x": [0.3, 0.5], "y": [0.1, 0.2]},
+                "translate_percent": None,
+                "translate_px": {"x": [10, 20], "y": [5, 10]},
+                "rotate": [333, 360],
+                "shear": {"x": [31, 38], "y": [41, 48]},
+                "interpolation": 3,
+                "fill": [10, 20, 30],
+                "fill_mask": 1,
+                "border_mode": cv2.BORDER_REFLECT,
+                "fit_output": False,
+                "keep_ratio": False,  # Explicitly set to False since x and y scale ranges are different
+            },
+        ],
+    ],
+    [
+        A.PiecewiseAffine,
+        {
+            "scale_range": (0.33, 0.33),
+            "nb_rows_range": (10, 20),
+            "nb_cols_range": (33, 33),
+            "interpolation": cv2.INTER_AREA,
+            "mask_interpolation": cv2.INTER_NEAREST,
+            "absolute_scale": True,
+        },
+    ],
+    [A.ChannelDropout, dict(dropout_ratio=0.25, fill=1)],
+    [A.ChannelShuffle, {}],
+    [
+        A.Downscale,
+        dict(
+            scale_range=[0.5, 0.75],
+            interpolation_pair={
+                "downscale": cv2.INTER_LINEAR,
+                "upscale": cv2.INTER_LINEAR,
+            },
+        ),
+    ],
+    [A.FromFloat, dict(dtype="uint8", max_value=1)],
+    [A.HorizontalFlip, {}],
+    [A.ISONoise, dict(color_shift_range=(0.2, 0.3), intensity_range=(0.7, 0.9))],
+    [A.InvertImg, {}],
+    [A.MaskDropout, dict(max_objects_range=(2, 2), fill=0, fill_mask=0)],
+    [A.NoOp, {}],
+    [
+        A.RandomResizedCrop,
+        dict(size=(20, 30), scale=(0.5, 0.6), ratio=(0.8, 0.9)),
+    ],
+    [A.FancyPCA, dict(alpha=0.3)],
+    [A.RandomRotate90, {}],
+    [A.ToGray, {"method": "pca"}],
+    [A.ToRGB, {}],
+    [A.ToSepia, {}],
+    [
+        A.Colorize,
+        dict(
+            black_range=((0, 0, 200), (10, 10, 255)),
+            mid_range=((100, 0, 100), (160, 50, 160)),
+            white_range=((220, 200, 0), (255, 255, 50)),
+            mid_value_range=(100, 160),
+        ),
+    ],
+    [A.Transpose, {}],
+    [A.VerticalFlip, {}],
+    [A.RingingOvershoot, dict(blur_range=(7, 15), cutoff_range=(np.pi / 5, np.pi / 2))],
+    [
+        A.UnsharpMask,
+        {
+            "blur_range": (3, 7),  # Allow for stronger blur
+            "sigma_range": (0.5, 2.0),  # Increase sigma range
+            "alpha_range": (0.5, 1.0),  # Allow for stronger sharpening
+            "threshold": 5,  # Lower threshold to allow more changes
+        },
+    ],
+    [A.AdvancedBlur, dict(blur_range=(3, 5), rotate_range=(60, 90))],
+    [
+        A.PixelDropout,
+        [
+            {"dropout_prob": 0.1, "per_channel": True, "drop_value": None},
+            {
+                "dropout_prob": 0.1,
+                "per_channel": False,
+                "drop_value": 2,
+                "mask_drop_value": 15,
+            },
+        ],
+    ],
+    [
+        A.RandomCropFromBorders,
+        dict(crop_left=0.2, crop_right=0.3, crop_top=0.05, crop_bottom=0.5),
+    ],
+    [
+        A.Spatter,
+        [
+            dict(
+                mode="rain",
+                mean_range=(0.65, 0.65),
+                std_range=(0.3, 0.3),
+                gauss_sigma_range=(2, 2),
+                cutout_threshold_range=(0.68, 0.68),
+                intensity_range=(0.6, 0.6),
+            ),
+            dict(
+                mode="mud",
+                mean_range=(0.65, 0.65),
+                std_range=(0.3, 0.3),
+                gauss_sigma_range=(2, 2),
+                cutout_threshold_range=(0.68, 0.68),
+                intensity_range=(0.6, 0.6),
+            ),
+        ],
+    ],
+    [
+        A.ChromaticAberration,
+        dict(
+            primary_distortion_range=(-0.02, 0.02),
+            secondary_distortion_range=(-0.05, 0.05),
+            mode="green_purple",
+            interpolation=cv2.INTER_LINEAR,
+        ),
+    ],
+    [A.Defocus, {"radius_range": (5, 7), "alias_blur_range": (0.2, 0.6)}],
+    [A.ZoomBlur, {"max_factor_range": (1.56, 1.7), "step_factor_range": (0.02, 0.04)}],
+    [
+        A.XYMasking,
+        {
+            "num_masks_x_range": (1, 3),
+            "num_masks_y_range": (3, 3),
+            "mask_x_length_range": (10, 20),
+            "mask_y_length_range": (10, 10),
+            "fill_mask": 1,
+            "fill": 0,
+        },
+    ],
+    [
+        A.PadIfNeeded,
+        {
+            "min_height": 512,
+            "min_width": 512,
+            "border_mode": 0,
+            "fill": [124, 116, 104],
+            "position": "top_left",
+        },
+    ],
+    [A.GlassBlur, dict(sigma=0.8, max_delta=5, iterations=3, mode="exact")],
+    [
+        A.GridDropout,
+        dict(
+            ratio=0.75,
+            holes_number_xy=(2, 10),
+            shift_xy=(10, 20),
+            random_offset=True,
+            fill=10,
+            fill_mask=20,
+        ),
+    ],
+    [A.Morphological, {}],
+    [A.D4, {}],
+    [A.SquareSymmetry, {}],
+    [A.AnnotationArtifacts, {}],
+    [A.PlanckianJitter, {}],
+    [A.OverlayElements, {}],
+    [A.CopyAndPaste, {}],
+    [A.RandomCropNearBBox, {}],
+    [A.GridElasticDeform, {"num_grid_xy": (10, 10), "magnitude": 10}],
+    [A.ShotNoise, {"scale_range": (0.1, 0.3)}],
+    [A.RicianNoise, {"std_range": (0.05, 0.15)}],
+    [A.BiasField, {"std_range": (0.1, 0.3), "scale_range": (0.03, 0.06)}],
+    [A.GibbsRinging, {"retained_fraction_range": (0.35, 0.7)}],
+    [
+        A.KSpaceSpikeNoise,
+        {
+            "num_spikes_range": (1, 3),
+            "intensity_range": (0.1, 0.4),
+            "per_channel": True,
+        },
+    ],
+    [
+        A.StochasticConvolution,
+        {
+            "kernel_range": (3, 7),
+            "strength_range": (0.1, 0.3),
+            "per_channel": True,
+            "border_mode": cv2.BORDER_REFLECT,
+        },
+    ],
+    [A.TimeReverse, {}],
+    [A.TimeMasking, {"time_mask_param": 10}],
+    [A.FrequencyMasking, {"freq_mask_param": 30}],
+    [A.Pad, {"padding": 10}],
+    [A.Erasing, {}],
+    [A.AdditiveNoise, {}],
+    [A.SaltAndPepper, {"amount_range": (0.5, 0.5), "salt_vs_pepper_range": (0.5, 0.5)}],
+    [A.PlasmaBrightnessContrast, {"brightness_range": (0.5, 0.5), "contrast_range": (0.5, 0.5)}],
+    [A.PlasmaShadow, {}],
+    [A.Illumination, {}],
+    [A.ThinPlateSpline, {}],
+    [
+        A.AutoContrast,
+        [
+            {"cutoff": 0, "ignore": None, "method": "cdf"},
+            {"cutoff": 0, "ignore": None, "method": "pil"},
+        ],
+    ],
+    [
+        A.PadIfNeeded3D,
+        {
+            "min_zyx": (300, 200, 400),
+            "pad_divisor_zyx": (10, 10, 10),
+            "position": "center",
+            "fill": 10,
+            "fill_mask": 20,
+        },
+    ],
+    [A.Pad3D, {"padding": 10}],
+    [
+        A.Anisotropy3D,
+        {
+            "axes": (0, 2),
+            "num_axes_range": (2, 2),
+            "downscale_factor_range": (2.0, 2.0),
+            "antialias": False,
+        },
+    ],
+    [A.Resize3D, {"size": (2, 30, 30), "interpolation": cv2.INTER_NEAREST, "mask_interpolation": cv2.INTER_LINEAR}],
+    [
+        A.ElasticTransform3D,
+        {
+            "displacement_range": (0.15, 0.15),
+            "control_grid_shape": (4, 5),
+            "interpolation": cv2.INTER_LINEAR,
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "border_mode": cv2.BORDER_REPLICATE,
+            "fill": 17,
+            "fill_mask": 31,
+        },
+    ],
+    [
+        A.Affine3D,
+        {
+            "rotate_range": {"x": (-10.0, 10.0), "y": (-5.0, 5.0), "z": (-15.0, 15.0)},
+            "scale_range": {"x": (0.9, 1.1), "y": (0.95, 1.05), "z": (0.85, 1.15)},
+            "translate_percent_range": {"x": (-0.1, 0.1), "y": (-0.05, 0.05), "z": (-0.2, 0.2)},
+            "interpolation": cv2.INTER_NEAREST,
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "border_mode": cv2.BORDER_REPLICATE,
+            "fill": 17,
+            "fill_mask": 31,
+        },
+    ],
+    [A.CenterCrop3D, {"size": (2, 30, 30)}],
+    [
+        A.GhostingArtifact,
+        {"num_ghosts_range": (3, 3), "intensity_range": (0.4, 0.6), "axis": 1, "restore_range": (0.1, 0.2)},
+    ],
+    [
+        A.MotionArtifact,
+        {
+            "num_events_range": (1, 1),
+            "rotate_range": (-10.0, 10.0),
+            "translate_percent_range": (-0.05, 0.05),
+            "axis": 1,
+            "interpolation": cv2.INTER_NEAREST,
+        },
+    ],
+    [A.RandomCrop3D, {"size": (2, 30, 30)}],
+    [
+        A.RandomResizedCrop3D,
+        {
+            "size": (2, 30, 30),
+            "scale": (0.2, 0.8),
+            "ratio": 1.2,
+            "interpolation": cv2.INTER_NEAREST,
+            "mask_interpolation": cv2.INTER_LINEAR,
+        },
+    ],
+    [
+        A.CoarseDropout3D,
+        {
+            "num_holes_range": (1, 3),
+            "hole_depth_range": (0.1, 0.2),
+            "hole_height_range": (0.1, 0.2),
+            "hole_width_range": (0.1, 0.2),
+            "fill": 0,
+            "fill_mask": None,
+        },
+    ],
+    [A.CubicSymmetry, {}],
+    [A.Flip3D, {"axes": (0, 2)}],
+    [A.RandomRotate90_3D, {"axis_pairs": ((0, 2),)}],
+    [A.AtLeastOneBBoxRandomCrop, {"height": 80, "width": 80, "erosion_factor": 0.2}],
+    [
+        A.ConstrainedCoarseDropout,
+        {
+            "num_holes_range": (1, 3),
+            "hole_height_range": (0.1, 0.2),
+            "hole_width_range": (0.1, 0.2),
+            "fill": 0,
+            "fill_mask": 0,
+            "mask_indices": [1],
+        },
+    ],
+    [A.RandomSizedBBoxSafeCrop, {"height": 80, "width": 80, "erosion_rate": 0.2}],
+    [A.BBoxSafeRandomCrop, {"erosion_rate": 0.2}],
+    [
+        A.BBoxSubsetSafeRandomCrop,
+        {
+            "subset_fraction_range": (0.3, 0.8),
+            "erosion_rate": 0.2,
+            "aspect_ratio_range": (0.4, 1.5),
+        },
+    ],
+    [
+        A.HEStain,
+        [
+            {
+                "method": "vahadane",
+                "intensity_scale_range": (0.5, 1.5),
+                "intensity_shift_range": (-0.1, 0.1),
+                "augment_background": False,
+            },
+            {
+                "method": "macenko",
+                "intensity_scale_range": (0.5, 1.5),
+                "intensity_shift_range": (-0.1, 0.1),
+                "augment_background": True,
+            },
+            {
+                "method": "random_preset",
+                "intensity_scale_range": (0.5, 1.5),
+                "intensity_shift_range": (-0.1, 0.1),
+                "augment_background": True,
+            },
+        ],
+    ],
+    [A.FDA, {"beta_range": (0.1, 0.3), "metadata_key": "fda_metadata"}],
+    [A.HistogramMatching, {"blend_ratio": (0.5, 1.0), "metadata_key": "hm_metadata"}],
+    [
+        A.PixelDistributionAdaptation,
+        {"blend_ratio": (0.25, 1.0), "transform_type": "pca", "metadata_key": "pda_metadata"},
+    ],
+    [
+        A.Mosaic,
+        {"grid_yx": (2, 2), "target_size": (256, 256), "cell_shape": (128, 128), "metadata_key": "mosaic_metadata"},
+    ],
+    [A.Dithering, {"method": "error_diffusion", "n_colors": 2}],
+    [A.GridShuffle3D, {"grid_zyx": (2, 2, 2)}],
+    [A.Vignetting, {"intensity_range": (0.3, 0.6), "center_range": (0.4, 0.6)}],
+    [A.ChannelSwap, {"channel_order": (1, 2, 0)}],
+    [A.FilmGrain, {"intensity_range": (0.1, 0.3), "grain_size_range": (1, 3)}],
+    [A.Halftone, {"dot_size_range": (4, 8), "blend_range": (0.0, 0.3)}],
+    [A.GridMask, {"num_grid_range": (3, 5), "line_width_range": (0.2, 0.4)}],
+    [A.LensFlare, {"intensity_range": (0.3, 0.6), "num_ghosts_range": (3, 5)}],
+    [
+        A.WaterRefraction,
+        {"amplitude_range": (0.002, 0.005), "wavelength_range": (0.1, 0.15), "keypoint_remapping_method": "direct"},
+    ],
+    [A.AtmosphericFog, {"density_range": (1.0, 2.0), "depth_mode": "linear"}],
+]
+
+_PARAMETER_MODE_SPECS: list[tuple[str, type[A.BasicTransform], dict[str, Any]]] = [
+    (
+        "gaussian-shared",
+        A.AdditiveNoise,
+        {
+            "noise_type": "gaussian",
+            "spatial_mode": "shared",
+            "noise_params": {"mean_range": (-0.1, 0.1), "std_range": (0.05, 0.15)},
+        },
+    ),
+    (
+        "patch-per-channel",
+        A.AdditiveNoise,
+        {
+            "noise_type": "gaussian",
+            "spatial_mode": "patch",
+            "noise_params": {"mean_range": (0.0, 0.0), "std_range": (0.05, 0.15)},
+            "patch_count_range": (2, 3),
+            "patch_height_range": (0.2, 0.4),
+            "patch_width_range": (0.3, 0.5),
+            "per_channel": True,
+        },
+    ),
+    (
+        "alternate-ranges",
+        A.AdvancedBlur,
+        {"sigma_x_range": (0.3, 0.8), "sigma_y_range": (0.4, 0.9), "beta_range": (0.7, 1.3), "noise_range": (0.8, 1.2)},
+    ),
+    (
+        "output-and-box-modes",
+        A.Affine,
+        {
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "fit_output": True,
+            "rotate_method": "ellipse",
+            "balanced_scale": True,
+            "scale": (0.8, 1.2),
+        },
+    ),
+    (
+        "mixed-elements",
+        A.AnnotationArtifacts,
+        {
+            "element_types": ("text", "arrow"),
+            "element_probabilities": (0.6, 0.4),
+            "count_range": (2, 4),
+            "text_length_range": (2, 6),
+            "font_scale_range": (0.4, 1.0),
+            "thickness_range": (2, 4),
+            "size_ratio_range": (0.15, 0.3),
+            "line_length_ratio_range": (0.2, 0.6),
+            "tip_length_range": (0.1, 0.3),
+            "corner_prob": 0.2,
+            "black_white_prob": 0.3,
+            "line_styles": ("solid", "dotted"),
+            "line_style_probabilities": (0.4, 0.6),
+            "random_color_prob": 0.25,
+            "color_palette": ((255, 255, 255), (12, 34, 56)),
+            "color_palette_probabilities": (0.7, 0.3),
+        },
+    ),
+    (
+        "random-angle",
+        A.AnnotationArtifacts,
+        {
+            "element_types": ("line",),
+            "element_probabilities": (1.0,),
+            "count_range": (2, 4),
+            "line_geometry": "random_angle",
+            "line_length_range": (8, 24),
+        },
+    ),
+    (
+        "random-endpoints",
+        A.AnnotationArtifacts,
+        {
+            "element_types": ("line",),
+            "element_probabilities": (1.0,),
+            "count_range": (2, 4),
+            "line_geometry": "random_endpoints",
+        },
+    ),
+    ("diagonal-colored", A.AtmosphericFog, {"fog_color": (180, 190, 200), "depth_mode": "diagonal"}),
+    ("cutoff-ignore", A.AutoContrast, {"cutoff": 5, "ignore": 0}),
+    (
+        "padded-top-left",
+        A.CenterCrop,
+        {
+            "pad_if_needed": True,
+            "pad_position": "top_left",
+            "border_mode": cv2.BORDER_REFLECT,
+            "fill": 7,
+            "fill_mask": 3,
+        },
+    ),
+    ("padded", A.CenterCrop3D, {"pad_if_needed": True, "fill": 7, "fill_mask": 3}),
+    ("selected-channels", A.ChannelDropout, {"channels_to_drop": (0, 2)}),
+    ("fixed-order", A.ChannelShuffle, {"channel_order": (2, 0, 1)}),
+    (
+        "red-blue-cubic",
+        A.ChromaticAberration,
+        {
+            "primary_distortion_range": (-0.01, 0.01),
+            "secondary_distortion_range": (-0.03, 0.03),
+            "mode": "red_blue",
+            "interpolation": cv2.INTER_CUBIC,
+        },
+    ),
+    ("fixed-fill", A.CoarseDropout, {"fill": 17, "fill_mask": 3}),
+    (
+        "alternate-ranges-and-fill",
+        A.CoarseDropout3D,
+        {
+            "hole_depth_range": (0.2, 0.3),
+            "hole_height_range": (0.2, 0.3),
+            "hole_width_range": (0.2, 0.3),
+            "fill": 7,
+            "fill_mask": 3,
+        },
+    ),
+    ("bbox-label-selection", A.ConstrainedCoarseDropout, {"fill": 7, "bbox_labels": [1], "mask_indices": None}),
+    (
+        "guided-protection",
+        A.GuidedCoarseDropout,
+        {"region_key": "sal", "fill": 7, "fill_mask": 0, "protected_bbox_labels": [1], "protection_margin": 0.15},
+    ),
+    (
+        "gaussian-scaled-donor",
+        A.CopyAndPaste,
+        {
+            "min_visibility_after_paste": 0.2,
+            "blend_mode": "gaussian",
+            "blend_sigma_range": (0.5, 1.5),
+            "scale_range": (0.8, 1.2),
+            "min_paste_area": 4,
+            "metadata_key": "donors",
+        },
+    ),
+    (
+        "padded-offset",
+        A.Crop,
+        {
+            "x_min": 5,
+            "y_min": 7,
+            "pad_if_needed": True,
+            "pad_position": "bottom_right",
+            "border_mode": cv2.BORDER_REFLECT,
+            "fill": 7,
+            "fill_mask": 3,
+        },
+    ),
+    ("percent-linear-mask", A.CropAndPad, {"px": None, "percent": (-0.1, 0.1), "mask_interpolation": cv2.INTER_LINEAR}),
+    ("ignored-mask-values", A.CropNonEmptyMaskIfExists, {"ignore_values": [0], "ignore_channels": []}),
+    ("fixed-element", A.D4, {"group_element": "r90"}),
+    (
+        "ordered-per-channel",
+        A.Dithering,
+        {
+            "method": "ordered",
+            "n_colors": 4,
+            "color_mode": "per_channel",
+            "error_diffusion_algorithm": "jarvis",
+            "bayer_matrix_size": 8,
+            "serpentine": True,
+            "noise_range": (-0.2, 0.2),
+        },
+    ),
+    (
+        "bounded-custom-grid",
+        A.ElasticTransform,
+        {
+            "displacement_range": (0.01, 0.04),
+            "control_grid_shape": (4, 6),
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "border_mode": cv2.BORDER_REFLECT,
+            "fill": 7,
+            "fill_mask": 3,
+        },
+    ),
+    (
+        "nearest-interpolation",
+        A.ElasticTransform3D,
+        {"interpolation": cv2.INTER_NEAREST},
+    ),
+    ("wide-alpha", A.Enhance, {"alpha_range": (0.2, 0.8)}),
+    ("explicit-mask", A.Equalize, {"mask": np.ones((128, 128, 1), dtype=np.uint8), "mask_params": ("mask",)}),
+    ("fixed-fill-and-shape", A.Erasing, {"scale": (0.1, 0.2), "ratio": (0.8, 1.2), "fill": 11, "fill_mask": 2}),
+    ("custom-metadata-key", A.FDA, {"metadata_key": "references"}),
+    ("fine-grain", A.FilmGrain, {"intensity_range": (0.05, 0.2), "grain_size_range": (2, 4)}),
+    ("short-mask", A.FrequencyMasking, {"freq_mask_param": 20}),
+    (
+        "per-channel-shifted-mean",
+        A.GaussNoise,
+        {"std_range": (0.1, 0.3), "mean_range": (-0.05, 0.05), "per_channel": True},
+    ),
+    ("wide-sigma", A.GaussianBlur, {"sigma_range": (0.2, 1.5)}),
+    (
+        "true-3d-anisotropic",
+        A.GaussianBlur,
+        {
+            "volume_mode": "3d",
+            "sigma_z_range": (0.2, 1.5),
+            "blur_z_range": (3, 5),
+        },
+    ),
+    (
+        "unnormalized-direct",
+        A.GridDistortion,
+        {
+            "normalized": False,
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "keypoint_remapping_method": "direct",
+            "border_mode": cv2.BORDER_REFLECT,
+            "fill": 7,
+            "fill_mask": 3,
+            "map_resolution_range": (0.5, 0.8),
+        },
+    ),
+    (
+        "fixed-offset-unit-size",
+        A.GridDropout,
+        {"holes_number_xy": None, "unit_size_range": (16, 24), "random_offset": False, "shift_xy": (1, 1)},
+    ),
+    (
+        "cubic-linear-mask",
+        A.GridElasticDeform,
+        {"interpolation": cv2.INTER_CUBIC, "mask_interpolation": cv2.INTER_LINEAR},
+    ),
+    ("rotated-fixed-fill", A.GridMask, {"rotation_range": (10, 20), "fill": 7, "fill_mask": 3}),
+    ("asymmetric-grid", A.GridShuffle3D, {"grid_zyx": (1, 2, 2)}),
+    ("explicit-preset", A.HEStain, {"method": "preset", "preset": "dark"}),
+    (
+        "custom-matrix",
+        A.HEStain,
+        {
+            "method": "custom",
+            "stain_matrix": np.array([[0.71, 0.65, 0.27], [0.18, 0.91, 0.37]], dtype=np.float32),
+        },
+    ),
+    (
+        "preserve-residual",
+        A.HEStain,
+        {
+            "method": "custom",
+            "stain_matrix": np.array([[0.71, 0.65, 0.27], [0.18, 0.91, 0.37]], dtype=np.float32),
+            "residual_mode": "preserve",
+            "augment_background": True,
+        },
+    ),
+    (
+        "augment-residual",
+        A.HEStain,
+        {
+            "method": "custom",
+            "stain_matrix": np.array([[0.71, 0.65, 0.27], [0.18, 0.91, 0.37]], dtype=np.float32),
+            "residual_mode": "augment",
+            "augment_background": True,
+        },
+    ),
+    (
+        "explicit-third-stain",
+        A.HEStain,
+        {
+            "method": "custom",
+            "stain_matrix": np.array(
+                [[0.65, 0.70, 0.29], [0.07, 0.99, 0.11], [0.27, 0.57, 0.78]],
+                dtype=np.float32,
+            ),
+            "residual_mode": "augment",
+            "augment_background": True,
+        },
+    ),
+    ("custom-reference", A.HistogramMatching, {"blend_ratio": (0.2, 0.4), "metadata_key": "references"}),
+    (
+        "gaussian-darken",
+        A.Illumination,
+        {
+            "mode": "gaussian",
+            "intensity_range": (0.05, 0.1),
+            "effect_type": "darken",
+            "angle_range": (30, 60),
+            "center_range": (0.3, 0.6),
+            "sigma_range": (0.3, 0.7),
+        },
+    ),
+    (
+        "gaussian-multiple",
+        A.Illumination,
+        {
+            "mode": "gaussian",
+            "num_spots_range": (2, 4),
+            "effect_type": "both",
+        },
+    ),
+    (
+        "gaussian-deterministic-spots",
+        A.Illumination,
+        {
+            "mode": "gaussian",
+            "num_spots_range": (2, 2),
+            "gaussian_spots": ((0.3, 0.4, 0.25, 0.1), (0.7, 0.6, 0.4, -0.08)),
+        },
+    ),
+    (
+        "wide-roi-rays",
+        A.LensFlare,
+        {"flare_roi": (0.1, 0.1, 0.8, 0.6), "num_rays_range": (6, 10), "bloom_range": (0.02, 0.08)},
+    ),
+    (
+        "custom-rendering",
+        A.LetterBox,
+        {"interpolation": cv2.INTER_CUBIC, "mask_interpolation": cv2.INTER_LINEAR, "fill": 7, "fill_mask": 3},
+    ),
+    (
+        "downscale-aware",
+        A.LongestMaxSize,
+        {"interpolation": cv2.INTER_CUBIC, "mask_interpolation": cv2.INTER_LINEAR, "area_for_downscale": "image_mask"},
+    ),
+    ("fixed-fill", A.MaskDropout, {"fill": 7, "fill_mask": 3}),
+    ("erosion-large-kernel", A.Morphological, {"scale": (4, 5), "operation": "erosion"}),
+    (
+        "wide-contain",
+        A.Mosaic,
+        {
+            "grid_yx": (2, 3),
+            "center_range": (0.2, 0.4),
+            "fit_mode": "contain",
+            "interpolation": cv2.INTER_CUBIC,
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "fill": 7,
+            "fill_mask": 3,
+            "metadata_key": "tiles",
+        },
+    ),
+    (
+        "centered-direction",
+        A.MotionBlur,
+        {"allow_shifted": False, "angle_range": (30, 60), "direction_range": (-0.5, 0.5)},
+    ),
+    ("per-image", A.Normalize, {"normalization": "image"}),
+    ("clipped-output", A.Normalize, {"clip_range": (-1.0, 1.0)}),
+    (
+        "fisheye-direct",
+        A.OpticalDistortion,
+        {
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "mode": "fisheye",
+            "keypoint_remapping_method": "direct",
+            "border_mode": cv2.BORDER_REFLECT,
+            "fill": 7,
+            "fill_mask": 3,
+            "map_resolution_range": (0.5, 0.8),
+        },
+    ),
+    ("custom-metadata-key", A.OverlayElements, {"metadata_key": "overlays"}),
+    ("reflect-fixed-fill", A.Pad, {"fill": 7, "fill_mask": 3, "border_mode": cv2.BORDER_REFLECT}),
+    ("fixed-fill", A.Pad3D, {"fill": 7, "fill_mask": 3}),
+    (
+        "divisor-mode",
+        A.PadIfNeeded,
+        {
+            "min_height": None,
+            "min_width": None,
+            "pad_height_divisor": 16,
+            "pad_width_divisor": 16,
+            "border_mode": cv2.BORDER_REFLECT,
+            "fill_mask": 3,
+        },
+    ),
+    ("random-position", A.PadIfNeeded3D, {"position": "random"}),
+    ("variable-output-linear-mask", A.Perspective, {"keep_size": False, "mask_interpolation": cv2.INTER_LINEAR}),
+    (
+        "wide-ranges-high-probability",
+        A.PhotoMetricDistort,
+        {
+            "brightness_range": (0.8, 1.2),
+            "contrast_range": (0.7, 1.3),
+            "saturation_range": (0.6, 1.4),
+            "hue_range": (-0.1, 0.1),
+            "distort_p": 0.8,
+        },
+    ),
+    (
+        "direct-low-resolution",
+        A.PiecewiseAffine,
+        {
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "keypoint_remapping_method": "direct",
+            "border_mode": cv2.BORDER_REFLECT,
+            "fill": 7,
+            "fill_mask": 3,
+            "map_resolution_range": (0.5, 0.8),
+        },
+    ),
+    (
+        "standard-custom-reference",
+        A.PixelDistributionAdaptation,
+        {"blend_ratio": (0.1, 0.5), "transform_type": "standard", "metadata_key": "references"},
+    ),
+    (
+        "linear-direct",
+        A.PixelSpread,
+        {
+            "interpolation": cv2.INTER_LINEAR,
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "keypoint_remapping_method": "direct",
+            "border_mode": cv2.BORDER_CONSTANT,
+            "fill": 7,
+            "fill_mask": 3,
+            "map_resolution_range": (0.5, 0.8),
+        },
+    ),
+    (
+        "cied-gaussian",
+        A.PlanckianJitter,
+        {"mode": "cied", "temperature_range": (4000, 12000), "sampling_method": "gaussian"},
+    ),
+    ("small-plasma", A.PlasmaBrightnessContrast, {"plasma_size": 64, "roughness": 2.0}),
+    ("small-plasma", A.PlasmaShadow, {"shadow_intensity_range": (0.2, 0.5), "plasma_size": 64, "roughness": 2.0}),
+    ("safe-output", A.RandomBrightnessContrast, {"ensure_safe_output": True}),
+    ("opencv-max", A.RandomBrightnessContrast, {"brightness_by_max": True}),
+    ("unbounded-gain", A.ExposureMatching, {"gain_range": None}),
+    (
+        "padded-bottom-right",
+        A.RandomCrop,
+        {
+            "pad_if_needed": True,
+            "pad_position": "bottom_right",
+            "border_mode": cv2.BORDER_REFLECT,
+            "fill": 7,
+            "fill_mask": 3,
+        },
+    ),
+    ("padded", A.RandomCrop3D, {"pad_if_needed": True, "fill": 7, "fill_mask": 3}),
+    ("custom-reference-box", A.RandomCropNearBBox, {"max_part_shift": (0.1, 0.2), "cropping_bbox_key": "crop_box"}),
+    ("upper-roi", A.RandomGravel, {"gravel_roi": (0.2, 0.2, 0.8, 0.8), "number_of_patches": 3}),
+    (
+        "downscale-aware",
+        A.RandomResizedCrop,
+        {"interpolation": cv2.INTER_CUBIC, "mask_interpolation": cv2.INTER_LINEAR, "area_for_downscale": "image_mask"},
+    ),
+    ("uniform-scale", A.RandomResizedCrop, {"sampling_method": "uniform_scale"}),
+    ("uniform-scale", A.RandomResizedCrop3D, {"sampling_method": "uniform_scale"}),
+    (
+        "output-proportions",
+        A.RandomResizedCrop3D,
+        {"ratio": None, "scale": (0.29296875, 0.29296875), "mask_interpolation": cv2.INTER_NEAREST},
+    ),
+    ("fixed-element", A.RandomRotate90, {"group_element": "r90"}),
+    ("subset-elements", A.RandomRotate90, {"group_elements": ("r90", "r270")}),
+    ("fixed-axis-rotation", A.RandomRotate90_3D, {"axis_pair": (0, 2), "group_element": "r90"}),
+    ("fixed-axes", A.Flip3D, {"flip_axes": (0, 2)}),
+    ("fixed-identity", A.Flip3D, {"flip_axes": ()}),
+    ("constant-fill", A.Affine3D, {"border_mode": cv2.BORDER_CONSTANT}),
+    ("linear-multiple-events", A.MotionArtifact, {"num_events_range": (2, 3)}),
+    ("anisotropic-range", A.RandomScale, {"scale_range": {"x": (-0.2, 0.3), "y": (-0.1, 0.15)}}),
+    ("downscale-aware", A.RandomScale, {"mask_interpolation": cv2.INTER_LINEAR, "area_for_downscale": "image_mask"}),
+    ("variable-intensity", A.RandomShadow, {"shadow_intensity_range": (0.2, 0.7)}),
+    (
+        "cubic-linear-mask",
+        A.RandomSizedBBoxSafeCrop,
+        {"interpolation": cv2.INTER_CUBIC, "mask_interpolation": cv2.INTER_LINEAR},
+    ),
+    (
+        "wide-ratio-downscale",
+        A.RandomSizedCrop,
+        {
+            "w2h_ratio": 1.2,
+            "interpolation": cv2.INTER_CUBIC,
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "area_for_downscale": "image_mask",
+        },
+    ),
+    ("texture", A.RandomSnow, {"method": "texture"}),
+    ("physics-based", A.RandomSunFlare, {"method": "physics_based"}),
+    (
+        "downscale-aware",
+        A.Resize,
+        {"interpolation": cv2.INTER_CUBIC, "mask_interpolation": cv2.INTER_LINEAR, "area_for_downscale": "image_mask"},
+    ),
+    ("wide-kernel", A.RingingOvershoot, {"blur_range": (9, 17)}),
+    (
+        "ellipse-cropped",
+        A.Rotate,
+        {
+            "border_mode": cv2.BORDER_REFLECT,
+            "rotate_method": "ellipse",
+            "crop_border": True,
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "fill_mask": 3,
+        },
+    ),
+    (
+        "ellipse-linear-mask",
+        A.SafeRotate,
+        {
+            "border_mode": cv2.BORDER_REFLECT,
+            "rotate_method": "ellipse",
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "fill_mask": 3,
+        },
+    ),
+    (
+        "ellipse-linear-mask",
+        A.ShiftScaleRotate,
+        {
+            "border_mode": cv2.BORDER_REFLECT,
+            "rotate_method": "ellipse",
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "fill_mask": 3,
+        },
+    ),
+    ("gaussian-kernel", A.Sharpen, {"method": "gaussian", "kernel_size": 7, "sigma": 1.5}),
+    ("stronger", A.ShotNoise, {"scale_range": (0.2, 0.4)}),
+    ("stronger", A.RicianNoise, {"std_range": (0.1, 0.3)}),
+    ("per-channel", A.RicianNoise, {"std_range": (0.05, 0.15), "per_channel": True}),
+    ("per-channel", A.BiasField, {"per_channel": True}),
+    ("full-resolution", A.BiasField, {"scale_range": (1.0, 1.0)}),
+    (
+        "shared-spikes",
+        A.KSpaceSpikeNoise,
+        {
+            "num_spikes_range": (2, 2),
+            "intensity_range": (0.2, 0.2),
+            "per_channel": False,
+        },
+    ),
+    (
+        "constant-border",
+        A.StochasticConvolution,
+        {
+            "kernel_range": (5, 5),
+            "strength_range": (0.2, 0.2),
+            "per_channel": False,
+            "border_mode": cv2.BORDER_CONSTANT,
+        },
+    ),
+    (
+        "max-size-hw-downscale",
+        A.SmallestMaxSize,
+        {
+            "max_size": None,
+            "max_size_hw": (80, 90),
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "area_for_downscale": "image_mask",
+        },
+    ),
+    (
+        "custom-rain",
+        A.Spatter,
+        {
+            "mean_range": (0.5, 0.6),
+            "std_range": (0.2, 0.25),
+            "gauss_sigma_range": (1, 3),
+            "cutout_threshold_range": (0.6, 0.7),
+            "intensity_range": (0.4, 0.7),
+            "color": (200, 200, 200),
+        },
+    ),
+    ("fixed-element", A.SquareSymmetry, {"group_element": "r90"}),
+    (
+        "direct-low-resolution",
+        A.ThinPlateSpline,
+        {
+            "scale_range": (0.1, 0.3),
+            "num_control_points": 5,
+            "interpolation": cv2.INTER_CUBIC,
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "keypoint_remapping_method": "direct",
+            "border_mode": cv2.BORDER_REFLECT,
+            "fill": 7,
+            "fill_mask": 3,
+            "map_resolution_range": (0.5, 0.8),
+        },
+    ),
+    ("single-channel", A.ToGray, {"num_output_channels": 1}),
+    ("rgba", A.ToRGB, {"num_output_channels": 4}),
+    ("wide-kernel", A.UnsharpMask, {"blur_range": (5, 9)}),
+    (
+        "direct-low-resolution",
+        A.WaterRefraction,
+        {
+            "num_waves_range": (4, 8),
+            "interpolation": cv2.INTER_CUBIC,
+            "mask_interpolation": cv2.INTER_LINEAR,
+            "border_mode": cv2.BORDER_CONSTANT,
+            "fill": 7,
+            "fill_mask": 3,
+            "map_resolution_range": (0.5, 0.8),
+        },
+    ),
+    ("fixed-fill", A.XYMasking, {"fill": 7}),
+    (
+        "float-float-ranges",
+        A.XYMasking,
+        {"mask_x_length_range": (0.1, 0.2), "mask_y_length_range": (0.2, 0.3)},
+    ),
+    (
+        "float-int-ranges",
+        A.XYMasking,
+        {"mask_x_length_range": (0.1, 0.2), "mask_y_length_range": (10, 20)},
+    ),
+    (
+        "int-float-ranges",
+        A.XYMasking,
+        {"mask_x_length_range": (10, 20), "mask_y_length_range": (0.2, 0.3)},
+    ),
+]
+
+
+_VARIANT_NAMES: dict[type[A.BasicTransform], tuple[str, ...]] = {
+    A.Affine: ("percent-translation", "pixel-translation"),
+    A.ShiftScaleRotate: ("shared-shift", "axis-shift"),
+    A.AtLeastOneBBoxRandomCrop: ("default-erosion", "nonzero-erosion"),
+    A.AutoContrast: ("cdf", "pil"),
+    A.CoarseDropout: ("pixel-holes", "relative-holes"),
+    A.Enhance: ("edge", "detail"),
+    A.HEStain: ("vahadane", "macenko", "random-preset"),
+    A.LetterBox: ("square-center", "wide-top-left", "tall-bottom-right"),
+    A.LongestMaxSize: ("max-size", "max-size-hw"),
+    A.PadIfNeeded: ("center", "top-left"),
+    A.CropAndPad: ("px", "px-choices", "percent-choices"),
+    A.PixelDropout: ("random-fill", "fixed-fill"),
+    A.RandomToneCurve: ("shared", "per-channel"),
+    A.Spatter: ("rain", "mud"),
+}
+
+_BBOX_TRANSFORMS = {
+    A.AtLeastOneBBoxRandomCrop,
+    A.BBoxSafeRandomCrop,
+    A.BBoxSubsetSafeRandomCrop,
+    A.RandomCropNearBBox,
+    A.RandomSizedBBoxSafeCrop,
+}
+_MASK_TRANSFORMS = {
+    A.ConstrainedCoarseDropout,
+    A.CropNonEmptyMaskIfExists,
+    A.MaskDropout,
+}
+_REFERENCE_METADATA_KEYS = {
+    A.FDA: "fda_metadata",
+    A.HistogramMatching: "hm_metadata",
+    A.PixelDistributionAdaptation: "pda_metadata",
+}
+_EXACT_TRANSFORMS = {
+    A.GibbsRinging,
+    A.GhostingArtifact,
+    A.Affine3D,
+    A.Anisotropy3D,
+    A.Blur,
+    A.CropAndPad,
+    A.ExposureMatching,
+    A.Flip3D,
+    A.HorizontalFlip,
+    A.NoOp,
+    A.Pad,
+    A.RandomRotate90,
+    A.RandomRotate90_3D,
+    A.Resize,
+    A.Resize3D,
+    A.Transpose,
+    A.UniformTemporalSubsample,
+    A.VerticalFlip,
+}
+
+
+def _case_data(
+    transform_cls: type[A.BasicTransform],
+    init_kwargs: Mapping[str, Any],
+) -> tuple[ContractDataFactory, ContractContextFactory, dict[str, Any], frozenset[str]]:
+    compose_kwargs: dict[str, Any] = {}
+    metadata_keys = frozenset[str]()
+    if issubclass(transform_cls, (A.Transform3D, A.VolumeOnlyTransform)):
+        case = (make_volume_data, make_empty_context)
+    elif transform_cls in _BBOX_TRANSFORMS:
+        compose_kwargs = {
+            "bbox_params": A.BboxParams(
+                coord_format="albumentations",
+                label_fields=["bbox_labels"],
+            ),
+        }
+        context_factory = make_empty_context
+        if transform_cls is A.RandomCropNearBBox:
+            key = init_kwargs.get("cropping_bbox_key", "cropping_bbox")
+            context_factory = make_crop_near_bbox_context(key)
+            metadata_keys = frozenset({key})
+        case = (make_hbb_data, context_factory)
+    elif transform_cls in _MASK_TRANSFORMS:
+        if transform_cls is A.ConstrainedCoarseDropout and init_kwargs.get("bbox_labels") is not None:
+            compose_kwargs = {
+                "bbox_params": A.BboxParams(
+                    coord_format="albumentations",
+                    label_fields=["bbox_labels"],
+                ),
+            }
+            case = (make_hbb_data, make_empty_context)
+        else:
+            case = (make_mask_data, make_empty_context)
+    elif transform_cls in _REFERENCE_METADATA_KEYS:
+        key = init_kwargs.get("metadata_key", _REFERENCE_METADATA_KEYS[transform_cls])
+        case = (make_image_data, make_reference_context(key))
+        metadata_keys = frozenset({key})
+    elif transform_cls is A.Mosaic:
+        key = init_kwargs.get("metadata_key", "mosaic_metadata")
+        case = (make_mask_data, make_mosaic_context(key))
+        metadata_keys = frozenset({key})
+    elif transform_cls is A.CopyAndPaste:
+        key = init_kwargs.get("metadata_key", "copy_paste_metadata")
+        case = (make_mask_data, make_copy_and_paste_context(key))
+        metadata_keys = frozenset({key})
+    elif transform_cls is A.OverlayElements:
+        key = init_kwargs.get("metadata_key", "overlay_metadata")
+        case = (make_image_data, make_overlay_context(key))
+        metadata_keys = frozenset({key})
+    elif transform_cls is A.GuidedCoarseDropout:
+        compose_kwargs = {
+            "bbox_params": A.BboxParams(
+                coord_format="albumentations",
+                label_fields=["bbox_labels"],
+            ),
+        }
+        case = (make_hbb_data, make_binary_region_context(init_kwargs.get("region_key", "dropout_region")))
+        metadata_keys = frozenset({init_kwargs.get("region_key", "dropout_region")})
+    elif transform_cls in {A.Colorize, A.ToRGB}:
+        case = (make_grayscale_image_data, make_empty_context)
+    elif transform_cls is A.FromFloat:
+        case = (make_float_image_data, make_empty_context)
+    elif transform_cls is A.UniformTemporalSubsample:
+        case = (make_target_image_batch_data, make_empty_context)
+    elif transform_cls is A.Equalize and init_kwargs.get("mask_params"):
+        case = (make_mask_data, make_empty_context)
+    else:
+        case = (make_image_data, make_empty_context)
+    return (*case, compose_kwargs, metadata_keys)
+
+
+def _slugify(name: str) -> str:
+    words = re.sub(r"(.)([A-Z][a-z]+)", r"\1-\2", name)
+    return re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", words).replace("_", "-").lower()
+
+
+def _required_targets(
+    transform_cls: type[A.BasicTransform],
+    init_kwargs: Mapping[str, Any],
+) -> frozenset[str]:
+    if transform_cls in {A.Mosaic, A.CopyAndPaste}:
+        return frozenset({"image"})
+    if transform_cls in {
+        A.AtLeastOneBBoxRandomCrop,
+        A.BBoxSafeRandomCrop,
+        A.BBoxSubsetSafeRandomCrop,
+        A.RandomSizedBBoxSafeCrop,
+    }:
+        return frozenset({"bboxes"})
+    if transform_cls is A.ConstrainedCoarseDropout:
+        return frozenset({"bboxes" if init_kwargs.get("bbox_labels") is not None else "mask"})
+    if transform_cls in {A.CropNonEmptyMaskIfExists, A.MaskDropout}:
+        return frozenset({"mask"})
+    return frozenset()
+
+
+def _iter_base_cases() -> list[TransformContractCase]:
+    cases: list[TransformContractCase] = []
+    seen_counts: dict[type[A.BasicTransform], int] = {}
+    for transform_cls, raw_params in _BASE_CASE_SPECS:
+        parameter_sets = raw_params if isinstance(raw_params, list) else [raw_params]
+        variants = _VARIANT_NAMES.get(transform_cls)
+        for params in parameter_sets:
+            primary_data_factory, context_factory, compose_kwargs, metadata_keys = _case_data(transform_cls, params)
+            index = seen_counts.get(transform_cls, 0)
+            seen_counts[transform_cls] = index + 1
+            if variants is not None and index >= len(variants):
+                raise ValueError(f"{transform_cls.__name__}: missing a name for variant {index}")
+            variant = variants[index] if variants is not None else "default"
+            case_id = f"{_slugify(transform_cls.__name__)}-{variant}"
+            cases.append(
+                TransformContractCase(
+                    case_id=case_id,
+                    transform_cls=transform_cls,
+                    init_kwargs=params,
+                    primary_data_factory=primary_data_factory,
+                    context_factory=context_factory,
+                    primary_compose_kwargs=compose_kwargs,
+                    replay_profile=(
+                        ReplayProfile.EXACT if transform_cls in _EXACT_TRANSFORMS else ReplayProfile.RUNNABLE
+                    ),
+                    metadata_keys=metadata_keys,
+                    required_targets=_required_targets(transform_cls, params),
+                    tensor_uint8_atol=2 if transform_cls is A.Anisotropy3D else 0,
+                ),
+            )
+    for transform_cls, variants in _VARIANT_NAMES.items():
+        if seen_counts.get(transform_cls) != len(variants):
+            raise ValueError(
+                f"{transform_cls.__name__}: expected {len(variants)} variants, got {seen_counts.get(transform_cls, 0)}",
+            )
+    return cases
+
+
+def _first_base_kwargs(transform_cls: type[A.BasicTransform]) -> dict[str, Any]:
+    for candidate_cls, raw_params in _BASE_CASE_SPECS:
+        if candidate_cls is not transform_cls:
+            continue
+        if isinstance(raw_params, list):
+            return copy.deepcopy(raw_params[0])
+        return copy.deepcopy(raw_params)
+    raise ValueError(f"{transform_cls.__name__} has no base transform contract case")
+
+
+def _iter_parameter_mode_cases() -> list[TransformContractCase]:
+    cases = []
+    for variant, transform_cls, overrides in _PARAMETER_MODE_SPECS:
+        params = _first_base_kwargs(transform_cls)
+        params.update(copy.deepcopy(overrides))
+        primary_data_factory, context_factory, compose_kwargs, metadata_keys = _case_data(transform_cls, params)
+        cases.append(
+            TransformContractCase(
+                case_id=f"{_slugify(transform_cls.__name__)}-{variant}",
+                transform_cls=transform_cls,
+                init_kwargs=params,
+                primary_data_factory=primary_data_factory,
+                context_factory=context_factory,
+                primary_compose_kwargs=compose_kwargs,
+                replay_profile=ReplayProfile.EXACT if transform_cls in _EXACT_TRANSFORMS else ReplayProfile.RUNNABLE,
+                metadata_keys=metadata_keys,
+                required_targets=_required_targets(transform_cls, params),
+            ),
+        )
+    return cases
+
+
+TRANSFORM_CONTRACT_CASES = (
+    *_iter_base_cases(),
+    *_iter_parameter_mode_cases(),
+)
+
+TRANSFORM_CASES_BY_CLASS: dict[type[A.BasicTransform], tuple[TransformContractCase, ...]] = {
+    transform_cls: tuple(case for case in TRANSFORM_CONTRACT_CASES if case.transform_cls is transform_cls)
+    for transform_cls in {case.transform_cls for case in TRANSFORM_CONTRACT_CASES}
+}
+
+PRIMARY_TRANSFORM_CONTRACT_CASES = tuple(
+    TRANSFORM_CASES_BY_CLASS[transform_cls][0]
+    for transform_cls in dict.fromkeys(case.transform_cls for case in TRANSFORM_CONTRACT_CASES)
+)
+
+ALL_DUAL_TRANSFORM_CONTRACT_CASES = tuple(
+    case for case in TRANSFORM_CONTRACT_CASES if issubclass(case.transform_cls, A.DualTransform)
+)
+
+PRIMARY_DUAL_TRANSFORM_CONTRACT_CASES = tuple(
+    case for case in PRIMARY_TRANSFORM_CONTRACT_CASES if issubclass(case.transform_cls, A.DualTransform)
+)
+
+PRIMARY_IMAGE_ONLY_TRANSFORM_CONTRACT_CASES = tuple(
+    case for case in PRIMARY_TRANSFORM_CONTRACT_CASES if issubclass(case.transform_cls, A.ImageOnlyTransform)
+)

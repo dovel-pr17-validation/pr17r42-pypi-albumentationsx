@@ -1,0 +1,444 @@
+"""Reusable target workloads for shared transform contracts."""
+
+from __future__ import annotations
+
+import copy
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Literal
+
+import numpy as np
+import torch
+
+import albumentations as A
+from albumentations.core.utils import get_volume_shape, get_volumes_shape
+from tests.helpers.contract_data import (
+    TARGET_VOLUME_SHAPE,
+    ContractDataFactory,
+    make_target_empty_hbb_data,
+    make_target_empty_keypoint_data,
+    make_target_float_image_mask_data,
+    make_target_grayscale_image_mask_data,
+    make_target_hbb_data,
+    make_target_image_batch_data,
+    make_target_image_mask_data,
+    make_target_keypoint_data,
+    make_target_mask_batch_data,
+    make_target_multispectral_image_mask_data,
+    make_target_noncontiguous_image_mask_data,
+    make_target_obb_data,
+    make_target_readonly_image_mask_data,
+    make_target_volume_data,
+    make_target_volumes_masks3d_data,
+)
+
+if TYPE_CHECKING:
+    from tests.helpers.transform_cases import TransformContractCase
+
+TargetAssertion = Callable[["TransformContractCase", dict[str, Any], dict[str, Any]], None]
+PrimaryDataAdapter = Callable[[ContractDataFactory, np.random.Generator], dict[str, Any]]
+
+
+def _as_numpy(value: Any) -> np.ndarray:
+    return value.numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
+
+
+def _image_spatial_shape(value: np.ndarray | torch.Tensor) -> tuple[int, int]:
+    return tuple(value.shape[-2:] if isinstance(value, torch.Tensor) else value.shape[:2])
+
+
+class ProfileCost(Enum):
+    """Execution tier for a reusable target workload."""
+
+    CORE = auto()
+    EXTENDED = auto()
+
+
+def _assert_image_mask(
+    case: TransformContractCase,
+    source: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    image = result["image"]
+    mask = result["mask"]
+    assert _image_spatial_shape(image) == _image_spatial_shape(mask)
+    assert image.dtype == source["image"].dtype
+    assert mask.dtype == source["mask"].dtype
+
+
+def _assert_bbox_fields(source: dict[str, Any], result: dict[str, Any], geometry_columns: int) -> None:
+    bboxes = _as_numpy(result["bboxes"])
+    assert len(bboxes) == len(result["bbox_labels"])
+    assert len(bboxes) == len(result["bbox_scores"])
+    assert set(zip(result["bbox_labels"], result["bbox_scores"], strict=True)) <= _collect_label_rows(
+        source,
+        ("bbox_labels", "bbox_scores"),
+    )
+    if len(bboxes) == 0:
+        return
+    assert bboxes.ndim == 2
+    assert bboxes.shape[1] == geometry_columns
+    assert np.isfinite(bboxes).all()
+
+
+def _collect_label_rows(value: Any, field_names: tuple[str, ...]) -> set[tuple[Any, ...]]:
+    rows: set[tuple[Any, ...]] = set()
+    if isinstance(value, dict):
+        if all(name in value and not isinstance(value[name], dict) for name in field_names):
+            rows.update(zip(*(np.atleast_1d(value[name]) for name in field_names), strict=True))
+        for item in value.values():
+            rows.update(_collect_label_rows(item, field_names))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            rows.update(_collect_label_rows(item, field_names))
+    return rows
+
+
+def _assert_hbb(case: TransformContractCase, source: dict[str, Any], result: dict[str, Any]) -> None:
+    _assert_image_mask(case, source, result)
+    _assert_bbox_fields(source, result, geometry_columns=4)
+    bboxes = _as_numpy(result["bboxes"])
+    if len(bboxes) > 0:
+        assert ((bboxes >= 0) & (bboxes <= 1)).all()
+
+
+def _assert_obb(case: TransformContractCase, source: dict[str, Any], result: dict[str, Any]) -> None:
+    _assert_image_mask(case, source, result)
+    _assert_bbox_fields(source, result, geometry_columns=5)
+    bboxes = _as_numpy(result["bboxes"])
+    if len(bboxes) > 0:
+        assert ((bboxes[:, :4] >= 0) & (bboxes[:, :4] <= 1)).all()
+
+
+def _assert_keypoints(case: TransformContractCase, source: dict[str, Any], result: dict[str, Any]) -> None:
+    _assert_image_mask(case, source, result)
+    keypoints = _as_numpy(result["keypoints"])
+    assert keypoints.ndim == 2
+    assert keypoints.shape[1] == 2
+    assert len(keypoints) == len(result["keypoint_labels"])
+    assert set(zip(result["keypoint_labels"])) <= _collect_label_rows(source, ("keypoint_labels",))
+    assert np.isfinite(keypoints).all()
+
+
+def _assert_volume_mask3d(
+    case: TransformContractCase,
+    source: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    volume = result["volume"]
+    mask3d = result["mask3d"]
+    if not issubclass(case.transform_cls, A.Transform3D):
+        depth_axis = -3 if isinstance(volume, torch.Tensor) else 0
+        assert volume.shape[depth_axis] == source["volume"].shape[depth_axis]
+        assert mask3d.shape[-3] == source["mask3d"].shape[-3]
+    spatial_shape = get_volume_shape(volume)
+    assert spatial_shape == mask3d.shape[-3:]
+    assert volume.dtype == source["volume"].dtype
+    assert mask3d.dtype == source["mask3d"].dtype
+
+
+def _assert_images(case: TransformContractCase, source: dict[str, Any], result: dict[str, Any]) -> None:
+    images = result["images"]
+    assert images.ndim == 4
+    assert images.shape[0] == source["images"].shape[0]
+    assert images.dtype == source["images"].dtype
+
+
+def _assert_image_shape(case: TransformContractCase, source: dict[str, Any], result: dict[str, Any]) -> None:
+    image = result["image"]
+    assert image.ndim == source["image"].ndim
+    assert _image_spatial_shape(image) == _image_spatial_shape(source["image"])
+
+
+def _assert_images_shape(case: TransformContractCase, source: dict[str, Any], result: dict[str, Any]) -> None:
+    images = result["images"]
+    assert images.ndim == source["images"].ndim
+    assert images.shape[0] == source["images"].shape[0]
+    if isinstance(images, torch.Tensor):
+        assert images.shape[-2:] == source["images"].shape[-2:]
+    else:
+        assert images.shape[1:3] == source["images"].shape[1:3]
+
+
+def _assert_volume_shape(case: TransformContractCase, source: dict[str, Any], result: dict[str, Any]) -> None:
+    volume = result["volume"]
+    assert volume.ndim == source["volume"].ndim
+    assert get_volume_shape(volume) == get_volume_shape(source["volume"])
+
+
+def _assert_volumes_shape(case: TransformContractCase, source: dict[str, Any], result: dict[str, Any]) -> None:
+    volumes = result["volumes"]
+    assert volumes.ndim == 5
+    assert volumes.shape[0] == source["volumes"].shape[0]
+    assert get_volumes_shape(volumes) == get_volumes_shape(source["volumes"])
+
+
+def _assert_volumes_masks3d(
+    case: TransformContractCase,
+    source: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    volumes = result["volumes"]
+    masks3d = result["masks3d"]
+    assert volumes.ndim == 5
+    assert masks3d.ndim in {4, 5}
+    assert len(volumes) == len(source["volumes"])
+    assert len(masks3d) == len(source["masks3d"])
+    assert get_volumes_shape(volumes) == get_volumes_shape(masks3d)
+    if not issubclass(case.transform_cls, A.Transform3D):
+        assert get_volumes_shape(volumes)[0] == get_volumes_shape(source["volumes"])[0]
+    assert volumes.dtype == source["volumes"].dtype
+    assert masks3d.dtype == source["masks3d"].dtype
+
+
+def _primary_image(data_factory: ContractDataFactory, rng: np.random.Generator) -> np.ndarray:
+    image = data_factory(rng)["image"]
+    return image if image.ndim == 3 else image[..., None]
+
+
+def _image_from_primary_data(data_factory: ContractDataFactory, rng: np.random.Generator) -> dict[str, Any]:
+    return {"image": _primary_image(data_factory, rng)}
+
+
+def _images_from_primary_data(data_factory: ContractDataFactory, rng: np.random.Generator) -> dict[str, Any]:
+    return {"images": np.stack([_primary_image(data_factory, rng) for _ in range(2)])}
+
+
+def _volume_from_primary_data(data_factory: ContractDataFactory, rng: np.random.Generator) -> dict[str, Any]:
+    depth = TARGET_VOLUME_SHAPE[0]
+    return {"volume": np.stack([_primary_image(data_factory, rng) for _ in range(depth)])}
+
+
+def _volumes_from_primary_data(data_factory: ContractDataFactory, rng: np.random.Generator) -> dict[str, Any]:
+    depth = TARGET_VOLUME_SHAPE[0]
+    volumes = [np.stack([_primary_image(data_factory, rng) for _ in range(depth)]) for _ in range(2)]
+    return {"volumes": np.stack(volumes)}
+
+
+def _assert_masks(case: TransformContractCase, source: dict[str, Any], result: dict[str, Any]) -> None:
+    masks = result["masks"]
+    assert masks.ndim == 3
+    assert masks.shape[0] > 0
+    assert masks.dtype == source["masks"].dtype
+
+
+@dataclass(frozen=True)
+class TargetProfile:
+    """One reusable input workload and its shared output assertions."""
+
+    profile_id: str
+    required_targets: frozenset[str]
+    data_factory: ContractDataFactory | None
+    assert_result: TargetAssertion
+    compose_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    cost: ProfileCost = ProfileCost.CORE
+    bbox_type: Literal["hbb", "obb"] | None = None
+    empty_targets: frozenset[str] = frozenset()
+    channel_count: int | None = 3
+    primary_data_adapter: PrimaryDataAdapter | None = None
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", self.profile_id):
+            raise ValueError(f"Invalid target profile_id: {self.profile_id!r}")
+        if (self.data_factory is None) == (self.primary_data_adapter is None):
+            raise ValueError(f"{self.profile_id}: provide exactly one data factory")
+        object.__setattr__(self, "compose_kwargs", MappingProxyType(copy.deepcopy(dict(self.compose_kwargs))))
+
+
+TARGET_CONTRACT_PROFILES = (
+    TargetProfile(
+        profile_id="image-mask",
+        required_targets=frozenset({"image", "mask"}),
+        data_factory=make_target_image_mask_data,
+        assert_result=_assert_image_mask,
+    ),
+    TargetProfile(
+        profile_id="hbb-labels",
+        required_targets=frozenset({"image", "mask", "bboxes"}),
+        data_factory=make_target_hbb_data,
+        assert_result=_assert_hbb,
+        compose_kwargs={
+            "bbox_params": A.BboxParams(
+                coord_format="albumentations",
+                label_fields=["bbox_labels", "bbox_scores"],
+            ),
+        },
+        bbox_type="hbb",
+    ),
+    TargetProfile(
+        profile_id="obb-labels",
+        required_targets=frozenset({"image", "mask", "bboxes"}),
+        data_factory=make_target_obb_data,
+        assert_result=_assert_obb,
+        compose_kwargs={
+            "bbox_params": A.BboxParams(
+                coord_format="albumentations",
+                bbox_type="obb",
+                label_fields=["bbox_labels", "bbox_scores"],
+            ),
+        },
+        bbox_type="obb",
+    ),
+    TargetProfile(
+        profile_id="keypoints-labels",
+        required_targets=frozenset({"image", "mask", "keypoints"}),
+        data_factory=make_target_keypoint_data,
+        assert_result=_assert_keypoints,
+        compose_kwargs={
+            "keypoint_params": A.KeypointParams(
+                coord_format="xy",
+                label_fields=["keypoint_labels"],
+                label_mapping={},
+            ),
+        },
+    ),
+    TargetProfile(
+        profile_id="volume-mask3d",
+        required_targets=frozenset({"volume", "mask3d"}),
+        data_factory=make_target_volume_data,
+        assert_result=_assert_volume_mask3d,
+        channel_count=3,
+    ),
+    TargetProfile(
+        profile_id="volumes-masks3d",
+        required_targets=frozenset({"volumes", "masks3d"}),
+        data_factory=make_target_volumes_masks3d_data,
+        assert_result=_assert_volumes_masks3d,
+        cost=ProfileCost.EXTENDED,
+        channel_count=3,
+    ),
+    TargetProfile(
+        profile_id="float-image-mask",
+        required_targets=frozenset({"image", "mask"}),
+        data_factory=make_target_float_image_mask_data,
+        assert_result=_assert_image_mask,
+        cost=ProfileCost.EXTENDED,
+    ),
+    TargetProfile(
+        profile_id="grayscale-image-mask",
+        required_targets=frozenset({"image", "mask"}),
+        data_factory=make_target_grayscale_image_mask_data,
+        assert_result=_assert_image_mask,
+        cost=ProfileCost.EXTENDED,
+        channel_count=1,
+    ),
+    TargetProfile(
+        profile_id="multispectral-image-mask",
+        required_targets=frozenset({"image", "mask"}),
+        data_factory=make_target_multispectral_image_mask_data,
+        assert_result=_assert_image_mask,
+        cost=ProfileCost.EXTENDED,
+        channel_count=5,
+    ),
+    TargetProfile(
+        profile_id="images-batch",
+        required_targets=frozenset({"images"}),
+        data_factory=make_target_image_batch_data,
+        assert_result=_assert_images,
+        cost=ProfileCost.EXTENDED,
+    ),
+    TargetProfile(
+        profile_id="masks-batch",
+        required_targets=frozenset({"masks"}),
+        data_factory=make_target_mask_batch_data,
+        assert_result=_assert_masks,
+        cost=ProfileCost.EXTENDED,
+    ),
+    TargetProfile(
+        profile_id="empty-hbb",
+        required_targets=frozenset({"image", "mask", "bboxes"}),
+        data_factory=make_target_empty_hbb_data,
+        assert_result=_assert_hbb,
+        compose_kwargs={
+            "bbox_params": A.BboxParams(
+                coord_format="albumentations",
+                label_fields=["bbox_labels", "bbox_scores"],
+            ),
+        },
+        cost=ProfileCost.EXTENDED,
+        bbox_type="hbb",
+        empty_targets=frozenset({"bboxes"}),
+    ),
+    TargetProfile(
+        profile_id="empty-keypoints",
+        required_targets=frozenset({"image", "mask", "keypoints"}),
+        data_factory=make_target_empty_keypoint_data,
+        assert_result=_assert_keypoints,
+        compose_kwargs={
+            "keypoint_params": A.KeypointParams(
+                coord_format="xy",
+                label_fields=["keypoint_labels"],
+                label_mapping={},
+            ),
+        },
+        cost=ProfileCost.EXTENDED,
+        empty_targets=frozenset({"keypoints"}),
+    ),
+    TargetProfile(
+        profile_id="noncontiguous-image-mask",
+        required_targets=frozenset({"image", "mask"}),
+        data_factory=make_target_noncontiguous_image_mask_data,
+        assert_result=_assert_image_mask,
+        cost=ProfileCost.EXTENDED,
+    ),
+    TargetProfile(
+        profile_id="readonly-image-mask",
+        required_targets=frozenset({"image", "mask"}),
+        data_factory=make_target_readonly_image_mask_data,
+        assert_result=_assert_image_mask,
+        cost=ProfileCost.EXTENDED,
+    ),
+)
+
+
+IMAGE_ONLY_TENSOR_TARGET_PROFILES = (
+    TargetProfile(
+        profile_id="image",
+        required_targets=frozenset({"image"}),
+        data_factory=None,
+        assert_result=_assert_image_shape,
+        primary_data_adapter=_image_from_primary_data,
+    ),
+    TargetProfile(
+        profile_id="images-batch",
+        required_targets=frozenset({"images"}),
+        data_factory=None,
+        assert_result=_assert_images_shape,
+        primary_data_adapter=_images_from_primary_data,
+    ),
+    TargetProfile(
+        profile_id="volume",
+        required_targets=frozenset({"volume"}),
+        data_factory=None,
+        assert_result=_assert_volume_shape,
+        primary_data_adapter=_volume_from_primary_data,
+    ),
+    TargetProfile(
+        profile_id="volumes-batch",
+        required_targets=frozenset({"volumes"}),
+        data_factory=None,
+        assert_result=_assert_volumes_shape,
+        primary_data_adapter=_volumes_from_primary_data,
+    ),
+)
+
+
+VOLUME_ONLY_TARGET_PROFILES = (
+    TargetProfile(
+        profile_id="volume",
+        required_targets=frozenset({"volume"}),
+        data_factory=make_target_volume_data,
+        assert_result=_assert_volume_shape,
+    ),
+    TargetProfile(
+        profile_id="volumes-batch",
+        required_targets=frozenset({"volumes"}),
+        data_factory=make_target_volumes_masks3d_data,
+        assert_result=_assert_volumes_shape,
+    ),
+)
+
+TARGET_PROFILES_BY_ID = {profile.profile_id: profile for profile in TARGET_CONTRACT_PROFILES}

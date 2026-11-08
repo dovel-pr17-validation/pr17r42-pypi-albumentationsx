@@ -1,0 +1,225 @@
+name: Release Candidate Verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      benchmark_baseline_ref:
+        description: "Git ref/SHA to use as the performance baseline."
+        required: true
+        default: "origin/main"
+        type: string
+      benchmark_candidate_ref:
+        description: "Git ref/SHA to use as the performance candidate. Defaults to the selected workflow ref."
+        required: false
+        type: string
+      benchmark_filter:
+        description: "Optional ASV --bench regex. Leave empty for the bounded release-core comparison."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release_candidate:
+    name: Release candidate verification
+    runs-on: ${{ matrix.operating-system }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        operating-system: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up test environment
+      uses: ./.github/actions/setup-ci
+      with:
+        python-version: ${{ matrix.python-version }}
+        dependency-group: ci-test
+        runtime-profile: torch-cpu
+    - name: Enforce release candidate memory budgets
+      if: runner.os == 'Linux' && matrix.python-version == '3.11'
+      run: python tools/check_memory.py --output release-candidate-evidence/memory-budget.json
+    - name: Verify matrix and regression vectors
+      if: matrix.operating-system == 'ubuntu-latest' && matrix.python-version == '3.12'
+      run: |
+        python -m tools.ci_matrix check
+        python tools/verify_regression_vectors.py --all
+    - name: Verify license and CLA provenance
+      if: matrix.operating-system == 'ubuntu-latest' && matrix.python-version == '3.11'
+      run: python tools/verify_legal_integrity.py
+    - name: Prepare release candidate evidence directory
+      run: python -c "from pathlib import Path; Path('release-candidate-evidence').mkdir(exist_ok=True)"
+    - name: Run release candidate tests
+      shell: bash
+      run: |
+        python -m tools.ci_shard select --shard-count 1 --shard-index 0 \
+          --exclude-file tests/test_pytorch.py \
+          --exclude-file tests/transforms3d/test_pytorch.py \
+          | xargs -0 python -m pytest \
+          -n 2 --dist=worksteal -m "not pytorch" \
+          --hypothesis-profile=release \
+          --junitxml=release-candidate-evidence/junit.xml
+    - name: Collect release candidate environment
+      if: always()
+      run: >
+        python tools/collect_test_environment.py
+        --output release-candidate-evidence/environment-${{ matrix.operating-system }}-${{ matrix.python-version }}.json
+        --command "release candidate verification"
+    - name: Summarize release candidate pytest results
+      if: always()
+      run: >
+        python tools/pytest_summary.py
+        --junit release-candidate-evidence/junit.xml
+        --output release-candidate-evidence/pytest-summary-${{ matrix.operating-system }}-${{ matrix.python-version }}.json
+        --allow-incomplete
+    - name: Collect benchmark coverage evidence
+      if: always() && matrix.operating-system == 'ubuntu-latest' && matrix.python-version == '3.12'
+      run: |
+        python -m tools.benchmark_coverage summary \
+          --output release-candidate-evidence/benchmark-coverage-${{ matrix.operating-system }}-${{ matrix.python-version }}.json
+        python -m tools.benchmark_coverage details \
+          --output release-candidate-evidence/benchmark-coverage-detail-${{ matrix.operating-system }}-${{ matrix.python-version }}.json
+    - name: Classify performance budget evidence
+      if: always() && matrix.operating-system == 'ubuntu-latest' && matrix.python-version == '3.12'
+      run: >
+        python -m tools.performance_budget summarize
+        --coverage-summary release-candidate-evidence/benchmark-coverage-${{ matrix.operating-system }}-${{ matrix.python-version }}.json
+        --coverage-detail release-candidate-evidence/benchmark-coverage-detail-${{ matrix.operating-system }}-${{ matrix.python-version }}.json
+        --core-only
+        --fail-on-release-blockers
+        --output release-candidate-evidence/benchmark-performance-budget-${{ matrix.operating-system }}-${{ matrix.python-version }}.json
+    - name: Upload release candidate evidence
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: release-candidate-${{ matrix.operating-system }}-${{ matrix.python-version }}
+        path: release-candidate-evidence/
+        if-no-files-found: ignore
+
+  release_candidate_pytorch:
+    name: Release candidate PyTorch compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up PyTorch test environment
+      uses: ./.github/actions/setup-ci
+      with:
+        python-version: "3.12"
+        dependency-group: ci-test
+        runtime-profile: torch-cpu
+    - name: Run PyTorch-marked tests
+      run: >-
+        python -m pytest -n 2 --dist=worksteal -m pytorch
+        tests/test_pytorch.py
+        tests/transforms3d/test_pytorch.py
+        tests/test_per_worker_seed.py
+        tests/test_flip_masks_comprehensive.py
+        tests/test_additional_targets.py
+
+  release_candidate_performance:
+    name: Release candidate performance comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+    - name: Set up benchmark environment
+      uses: ./.github/actions/setup-ci
+      with:
+        python-version: "3.12"
+        dependency-group: ci-benchmark
+        runtime-profile: torch-cpu
+    - name: Prepare release candidate performance evidence directory
+      run: python -c "from pathlib import Path; Path('release-candidate-performance-evidence').mkdir(exist_ok=True)"
+    - name: Collect release candidate performance environment
+      run: >
+        python tools/collect_test_environment.py
+        --output release-candidate-performance-evidence/environment-performance.json
+        --command "release candidate ASV performance comparison"
+    - name: Collect benchmark coverage evidence
+      run: |
+        python -m tools.benchmark_coverage summary \
+          --output release-candidate-performance-evidence/benchmark-coverage.json
+        python -m tools.benchmark_coverage details \
+          --output release-candidate-performance-evidence/benchmark-coverage-detail.json
+    - name: Register ASV machine profile
+      working-directory: benchmark
+      run: asv --config asv.conf.json machine --yes
+    - name: Compare release candidate benchmarks
+      working-directory: benchmark
+      env:
+        INPUT_BASELINE_REF: ${{ inputs.benchmark_baseline_ref }}
+        INPUT_BENCH_FILTER: ${{ inputs.benchmark_filter }}
+        INPUT_CANDIDATE_REF: ${{ inputs.benchmark_candidate_ref }}
+      run: |
+        set -o pipefail
+        BASELINE_REF="$INPUT_BASELINE_REF"
+        CANDIDATE_REF="$INPUT_CANDIDATE_REF"
+        BENCH_FILTER="$INPUT_BENCH_FILTER"
+        if [ -z "$CANDIDATE_REF" ]; then
+          CANDIDATE_REF="HEAD"
+        fi
+        if [ -z "$BENCH_FILTER" ]; then
+          BENCH_FILTER="$(python "$GITHUB_WORKSPACE/tools/select_benchmark_filters.py" --profile release-core)"
+        fi
+        BASELINE_SHA="$(git rev-parse "$BASELINE_REF")"
+        CANDIDATE_SHA="$(git rev-parse "$CANDIDATE_REF")"
+        echo "$BASELINE_REF" > "$GITHUB_WORKSPACE/release-candidate-performance-evidence/benchmark-baseline-ref.txt"
+        echo "$BASELINE_SHA" > "$GITHUB_WORKSPACE/release-candidate-performance-evidence/benchmark-baseline-sha.txt"
+        echo "$CANDIDATE_REF" > "$GITHUB_WORKSPACE/release-candidate-performance-evidence/benchmark-candidate-ref.txt"
+        echo "$CANDIDATE_SHA" > "$GITHUB_WORKSPACE/release-candidate-performance-evidence/benchmark-candidate-sha.txt"
+        echo "$BENCH_FILTER" > "$GITHUB_WORKSPACE/release-candidate-performance-evidence/benchmark-filter.txt"
+        ASV_COMMAND=(
+          asv --config asv.conf.json continuous
+          --factor 1.05
+          --split
+          --show-stderr
+          --attribute repeat=1
+          --attribute number=1
+        )
+        if [ -n "$BENCH_FILTER" ]; then
+          ASV_COMMAND+=(--bench "$BENCH_FILTER")
+        fi
+        ASV_COMMAND+=("$BASELINE_REF" "$CANDIDATE_REF")
+        ASV_EXIT_CODE=0
+        "${ASV_COMMAND[@]}" 2>&1 | tee "$GITHUB_WORKSPACE/release-candidate-performance-evidence/asv-continuous.txt" || ASV_EXIT_CODE=$?
+        echo "$ASV_EXIT_CODE" > "$GITHUB_WORKSPACE/release-candidate-performance-evidence/asv-continuous-exit-code.txt"
+    - name: Summarize ASV comparison evidence
+      if: always()
+      run: |
+        ASV_EXIT_CODE="$(cat release-candidate-performance-evidence/asv-continuous-exit-code.txt 2>/dev/null || true)"
+        if [ -n "$ASV_EXIT_CODE" ]; then
+          python tools/asv_summary.py \
+            --input release-candidate-performance-evidence/asv-continuous.txt \
+            --output release-candidate-performance-evidence/benchmark-asv-summary.json \
+            --asv-exit-code "$ASV_EXIT_CODE"
+        else
+          python tools/asv_summary.py \
+            --input release-candidate-performance-evidence/asv-continuous.txt \
+            --output release-candidate-performance-evidence/benchmark-asv-summary.json
+        fi
+    - name: Classify strict performance budget evidence
+      if: always()
+      run: >
+        python -m tools.performance_budget summarize
+        --coverage-summary release-candidate-performance-evidence/benchmark-coverage.json
+        --coverage-detail release-candidate-performance-evidence/benchmark-coverage-detail.json
+        --asv-summary release-candidate-performance-evidence/benchmark-asv-summary.json
+        --core-only
+        --require-comparison
+        --fail-on-release-blockers
+        --output release-candidate-performance-evidence/benchmark-performance-budget.json
+    - name: Upload release candidate performance evidence
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: release-candidate-performance
+        path: release-candidate-performance-evidence/
+        if-no-files-found: ignore

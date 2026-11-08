@@ -1,0 +1,298 @@
+import argparse
+import inspect
+import re
+import sys
+from pathlib import Path
+
+sys.path.append("..")
+import albumentations
+from albumentations.core.type_definitions import ALL_TARGETS, Targets
+
+IGNORED_CLASSES = {
+    "BasicTransform",
+    "DualTransform",
+    "ImageOnlyTransform",
+    "Transform3D",
+    "VolumeOnlyTransform",
+}
+
+UTM_QUERY_RE = re.compile(r"\?utm_(?:source|medium|campaign|term|content)=[^)\s|]+")
+
+
+def make_augmentation_docs_link(cls) -> str:
+    return f"[{cls.__name__}](https://albumentations.ai/explore/transform/{cls.__name__}/)"
+
+
+def strip_utm_query_params(text: str) -> str:
+    return UTM_QUERY_RE.sub("", text)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(help="Commands", dest="command")
+    subparsers.add_parser("make")
+    check_parser = subparsers.add_parser("check")
+    check_parser.add_argument("filepath", type=str, help="Path to a file that should be checked")
+    return parser.parse_args()
+
+
+def make_separator(width: int, align_center: bool) -> str:
+    if align_center:
+        return ":" + "-" * (width - 2) + ":"
+    return "-" * width
+
+
+def is_medical_transform(cls: type) -> bool:
+    return cls.__module__.startswith("albumentations.augmentations.medical.")
+
+
+def get_image_only_transforms_info():
+    image_only_info = {}
+    members = inspect.getmembers(albumentations)
+    for name, cls in members:
+        if (
+            inspect.isclass(cls)
+            and issubclass(cls, albumentations.ImageOnlyTransform)
+            and not issubclass(cls, albumentations.Transform3D)
+            and name not in IGNORED_CLASSES
+            and not is_medical_transform(cls)
+        ):
+            image_only_info[name] = {
+                "docs_link": make_augmentation_docs_link(cls),
+            }
+    return image_only_info
+
+
+def get_dual_transforms_info():
+    dual_transforms_info = {}
+    members = inspect.getmembers(albumentations)
+    for name, cls in members:
+        if (
+            inspect.isclass(cls)
+            and issubclass(cls, albumentations.DualTransform)
+            and not issubclass(cls, albumentations.Transform3D)  # Exclude 3D transforms
+            and name not in IGNORED_CLASSES
+            and not is_medical_transform(cls)
+        ):
+            supported_bbox_types = getattr(cls, "_supported_bbox_types", frozenset({"hbb"}))
+
+            dual_transforms_info[name] = {
+                "targets": cls._targets,
+                "supported_bbox_types": supported_bbox_types,
+                "docs_link": make_augmentation_docs_link(cls),
+            }
+    return dual_transforms_info
+
+
+def get_3d_transforms_info():
+    transforms_3d_info = {}
+    members = inspect.getmembers(albumentations)
+    for name, cls in members:
+        if (
+            inspect.isclass(cls)
+            and issubclass(cls, (albumentations.Transform3D, albumentations.VolumeOnlyTransform))
+            and name not in IGNORED_CLASSES
+            and not is_medical_transform(cls)
+        ):
+            targets = cls._targets if hasattr(cls, "_targets") else albumentations.Transform3D._targets
+
+            transforms_3d_info[name] = {
+                "targets": targets if isinstance(targets, tuple) else (targets,),
+                "docs_link": make_augmentation_docs_link(cls),
+            }
+    return transforms_3d_info
+
+
+def get_medical_transforms_info():
+    return {
+        name: {"targets": cls._targets, "docs_link": make_augmentation_docs_link(cls)}
+        for name, cls in inspect.getmembers(albumentations)
+        if inspect.isclass(cls) and issubclass(cls, albumentations.BasicTransform) and is_medical_transform(cls)
+    }
+
+
+def make_transforms_targets_table(transforms_info, header, targets_to_check=None, split_bboxes=False):
+    rows = [header]
+    for transform, info in sorted(transforms_info.items(), key=lambda kv: kv[0]):
+        transform_targets = []
+        targets_iter = targets_to_check or Targets
+        for target in targets_iter:
+            if split_bboxes and target == Targets.BBOXES:
+                supported_bbox_types = info.get("supported_bbox_types", frozenset({"hbb"}))
+                hbb_mark = "✓" if target in info["targets"] and "hbb" in supported_bbox_types else ""
+                obb_mark = "✓" if target in info["targets"] and "obb" in supported_bbox_types else ""
+                transform_targets.extend([hbb_mark, obb_mark])
+            else:
+                mark = "✓" if target in info["targets"] else ""
+                transform_targets.append(mark)
+        row = [info["docs_link"] or transform, *transform_targets]
+        rows.append(row)
+
+    column_widths = [max(len(r) for r in column) for column in zip(*rows, strict=True)]
+    lines = [
+        " | ".join(
+            "{title: <{width}}".format(width=width, title=title)
+            for width, title in zip(column_widths, rows[0], strict=True)
+        ),
+        " | ".join(
+            make_separator(width, align_center=column_index > 0) for column_index, width in enumerate(column_widths)
+        ),
+    ]
+    lines.extend(
+        " | ".join(
+            "{column: <{width}}".format(width=width, column=column)
+            for width, column in zip(column_widths, row, strict=True)
+        )
+        for row in rows[1:]
+    )
+    return "\n".join(f"| {line} |" for line in lines)
+
+
+def make_transforms_targets_links(transforms_info):
+    return "\n".join("- " + info["docs_link"] for _, info in sorted(transforms_info.items(), key=lambda kv: kv[0]))
+
+
+def check_docs(
+    filepath: str,
+    image_only_transforms_links: str,
+    dual_transforms_table: str,
+    transforms_3d_table: str,
+    medical_transforms_table: str,
+) -> None:
+    """Check if the documentation file is up to date with the current transforms.
+
+    Args:
+        filepath (str): Path to the documentation file (README.md)
+        image_only_transforms_links (str): Generated links for pixel-level transforms
+        dual_transforms_table (str): Generated table for spatial-level transforms
+        transforms_3d_table (str): Generated table for 3D transforms
+        medical_transforms_table (str): Generated table for medical transforms
+
+    Raises:
+        ValueError: If any section is outdated with detailed information about missing lines
+
+    """
+    with Path(filepath).open(encoding="utf8") as f:
+        text = f.read()
+
+    sections = {
+        "Pixel-level": {
+            "pattern": r"### Pixel-level transforms\n\n(.*?)(?=###|\Z)",
+            "generated": image_only_transforms_links,
+            "lines_not_in_text": [],
+        },
+        "Spatial-level": {
+            "pattern": r"### Spatial-level transforms\n\n(.*?)(?=###|\Z)",
+            "generated": dual_transforms_table,
+            "lines_not_in_text": [],
+        },
+        "3D": {
+            "pattern": r"### 3D transforms\n\n(.*?)(?=###|\Z)",
+            "generated": transforms_3d_table,
+            "lines_not_in_text": [],
+        },
+        "Medical": {
+            "pattern": r"### Medical transforms\n\n(.*?)(?=###|\Z)",
+            "generated": medical_transforms_table,
+            "lines_not_in_text": [],
+        },
+    }
+
+    outdated_docs = set()
+
+    for section_name, section_info in sections.items():
+        match = re.search(section_info["pattern"], text, re.DOTALL)
+        if not match:
+            outdated_docs.add(section_name)
+            section_info["lines_not_in_text"].extend(
+                section_info["generated"].split("\n"),
+            )
+            continue
+
+        section_content = strip_utm_query_params(match[1].strip())
+        for line in section_info["generated"].split("\n"):
+            if line.strip() and line not in section_content:
+                outdated_docs.add(section_name)
+                section_info["lines_not_in_text"].append(line)
+
+    if outdated_docs:
+        msg = (
+            "Docs for the following transform types are outdated: {outdated_docs_headers}.\n"
+            "Generate new docs by executing the `python -m tools.{py_file} make` command "
+            "and paste them to {filename}.\n\n"
+        ).format(
+            outdated_docs_headers=", ".join(sorted(outdated_docs)),
+            py_file=Path(__file__).stem,
+            filename=Path(filepath).name,
+        )
+
+        for section_name, section_info in sections.items():
+            if section_name in outdated_docs:
+                msg += (
+                    f"# {section_name} transforms lines not in file:\n"
+                    f"{chr(10).join(section_info['lines_not_in_text'])}\n\n"
+                )
+
+        raise ValueError(msg.strip())
+
+
+def generated_transform_docs() -> tuple[str, str, str, str]:
+    """Return the generated README content for each transform category."""
+    image_only_transforms = get_image_only_transforms_info()
+    dual_transforms = get_dual_transforms_info()
+    transforms_3d = get_3d_transforms_info()
+
+    image_only_transform_links = make_transforms_targets_links(image_only_transforms)
+
+    dual_header = []
+    for target in ALL_TARGETS:
+        if target == Targets.BBOXES:
+            dual_header.extend(["BBoxes (HBB)", "BBoxes (OBB)"])
+        else:
+            dual_header.append(target.value)
+
+    dual_transform_table = make_transforms_targets_table(
+        dual_transforms,
+        header=["Transform", *dual_header],
+        targets_to_check=ALL_TARGETS,
+        split_bboxes=True,
+    )
+    targets_3d = [Targets.VOLUME, Targets.VOLUMES, Targets.MASK3D, Targets.MASKS3D, Targets.KEYPOINTS]
+    transforms_3d_table = make_transforms_targets_table(
+        transforms_3d,
+        header=["Transform", *[target.value for target in targets_3d]],
+        targets_to_check=targets_3d,
+    )
+    medical_targets = [Targets.IMAGE, Targets.IMAGES, Targets.VOLUME, Targets.VOLUMES]
+    medical_transforms_table = make_transforms_targets_table(
+        get_medical_transforms_info(),
+        header=["Transform", *[target.value for target in medical_targets]],
+        targets_to_check=medical_targets,
+    )
+    return image_only_transform_links, dual_transform_table, transforms_3d_table, medical_transforms_table
+
+
+def check_transform_docs(filepath: str | Path) -> None:
+    """Raise when transform documentation in ``filepath`` is out of date."""
+    check_docs(str(filepath), *generated_transform_docs())
+
+
+def main() -> None:
+    args = parse_args()
+    command = args.command
+    if command not in {"make", "check"}:
+        raise ValueError(f"You should provide a valid command: {{make|check}}. Got {command} instead.")
+
+    docs = generated_transform_docs()
+
+    if command == "make":
+        for category, content in zip(("Pixel-level", "Spatial-level", "3D", "Medical"), docs, strict=True):
+            print(f"===== COPY THIS TABLE TO README.MD BELOW ### {category} transforms =====")
+            print(content)
+            print("===== END OF COPY =====\n")
+    else:
+        check_docs(args.filepath, *docs)
+
+
+if __name__ == "__main__":
+    main()

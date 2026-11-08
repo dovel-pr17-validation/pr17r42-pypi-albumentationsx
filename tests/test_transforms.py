@@ -1,0 +1,3761 @@
+import copy
+import json
+import random
+from collections.abc import Callable
+from functools import partial
+from typing import Any
+
+import cv2
+import numpy as np
+import pytest
+from albucore import MAX_VALUES_BY_DTYPE, clip, from_float, to_float
+
+import albumentations as A
+import albumentations.augmentations.geometric.functional as fgeometric
+import albumentations.augmentations.pixel.functional as fpixel
+from albumentations.augmentations.pixel import _functional_noise as fnoise
+from albumentations.core.invocation import SamplingContext
+from albumentations.core.tensor import numpy_to_tensor_spatial, tensor_to_numpy_spatial
+from albumentations.core.transform_params import SampledParams
+from albumentations.core.transforms_interface import BasicTransform
+from tests.conftest import (
+    IMAGES,
+    RECTANGULAR_UINT8_IMAGE,
+    SQUARE_FLOAT_IMAGE,
+    SQUARE_MULTI_UINT8_IMAGE,
+    SQUARE_UINT8_IMAGE,
+)
+from tests.helpers import TransformTestHelper
+
+from .utils import (
+    get_primary_2d_transform_params,
+    get_primary_dual_transform_params,
+    get_primary_image_only_transform_params,
+    make_sampling_args,
+)
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+@pytest.mark.parametrize(
+    ("target", "shape"),
+    [
+        ("image", (16, 16, 1)),
+        ("images", (2, 16, 16, 1)),
+        ("volume", (2, 16, 16, 1)),
+        ("volumes", (2, 2, 16, 16, 1)),
+    ],
+)
+def test_random_gamma_identity(dtype: np.dtype, target: str, shape: tuple[int, ...]) -> None:
+    source = np.resize(np.arange(256, dtype=np.uint8), shape)
+    if dtype == np.float32:
+        source = source.astype(np.float32) / 255
+    expected = source.copy()
+    transform = A.Compose([A.RandomGamma(gamma_range=(100, 100), p=1)], strict=True, telemetry=False)
+
+    result = transform(**{target: source})[target]
+
+    assert result.dtype == source.dtype
+    np.testing.assert_array_equal(result, expected)
+    np.testing.assert_array_equal(source, expected)
+
+
+def test_transpose_both_image_and_mask():
+    image = np.ones((8, 6, 3))
+    mask = np.ones((8, 6))
+    augmentation = A.Transpose(p=1)
+    augmented = augmentation(image=image, mask=mask)
+    assert augmented["image"].shape == (6, 8, 3)
+    assert augmented["mask"].shape == (6, 8)
+
+
+def test_rotate_crop_border(image):
+    height = image.shape[0]
+    border_value = 256
+    aug = A.Rotate(
+        angle_range=(45, 45),
+        p=1,
+        fill=border_value,
+        border_mode=cv2.BORDER_CONSTANT,
+        crop_border=True,
+    )
+    aug_img = aug(image=image)["image"]
+    expected_size = int(np.round(height / np.sqrt(2)))
+    assert aug_img.shape[0] == expected_size
+    assert (aug_img == border_value).sum() == 0
+
+
+def test_morphological_dilates_bboxes():
+    image = np.zeros((32, 1024, 3), dtype=np.uint8)
+    bboxes = np.array(
+        [
+            [100 / 1024, 5 / 32, 120 / 1024, 15 / 32],
+            [300 / 1024, 10 / 32, 330 / 1024, 20 / 32],
+        ],
+        dtype=np.float32,
+    )
+    labels = [137, 138]
+    transform = A.Compose(
+        [A.Morphological(scale=(3, 3), operation="dilation", p=1.0)],
+        bbox_params=A.BboxParams(coord_format="albumentations", label_fields=["labels"]),
+    )
+
+    result = transform(image=image, bboxes=bboxes, labels=labels)
+
+    expected_bboxes = np.array(
+        [
+            [99 / 1024, 4 / 32, 121 / 1024, 16 / 32],
+            [299 / 1024, 9 / 32, 331 / 1024, 21 / 32],
+        ],
+        dtype=np.float32,
+    )
+
+    np.testing.assert_allclose(np.array(result["bboxes"], dtype=np.float32), expected_bboxes)
+    assert result["labels"] == labels
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_dual_transform_params(
+        custom_arguments={
+            A.GridDropout: {"fill_mask": 0},
+        },
+        except_augmentations={
+            A.RandomCropNearBBox,
+            A.RandomSizedBBoxSafeCrop,
+            A.BBoxSafeRandomCrop,
+            A.PixelDropout,
+            A.Lambda,
+            A.RandomRotate90,
+            A.D4,
+            A.VerticalFlip,
+            A.HorizontalFlip,
+            A.Transpose,
+            A.MaskDropout,
+            A.GuidedCoarseDropout,
+            A.BBoxSubsetSafeRandomCrop,
+        },
+    ),
+)
+def test_binary_mask_interpolation(augmentation_cls, params, image):
+    """Checks whether transformations based on DualTransform does not introduce a mask interpolation artifacts"""
+    # Deep copy params to avoid mutating shared test parameters
+    params = copy.deepcopy(params)
+    params["mask_interpolation"] = cv2.INTER_NEAREST
+    params["fill_mask"] = 0
+
+    aug = augmentation_cls(p=1, **params)
+    mask = cv2.randu(np.zeros((100, 100, 1), dtype=np.uint8), 0, 2)
+    data = {
+        "image": image,
+        "mask": mask,
+    }
+    if augmentation_cls == A.OverlayElements:
+        data["overlay_metadata"] = []
+    elif augmentation_cls == A.Mosaic:
+        data["mosaic_metadata"] = [
+            {
+                "image": image,
+                "mask": mask,
+            },
+        ]
+    elif augmentation_cls == A.CopyAndPaste:
+        data["copy_paste_metadata"] = []
+    result = aug(**data)
+    np.testing.assert_array_equal(np.unique(result["mask"]), np.array([0, 1]))
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_dual_transform_params(
+        custom_arguments={
+            A.GridDropout: {"holes_number_xy": (10, 10), "fill_mask": 64},
+        },
+        except_augmentations={
+            A.RandomSizedBBoxSafeCrop,
+            A.PixelDropout,
+            A.CropNonEmptyMaskIfExists,
+            A.PixelDistributionAdaptation,
+            A.PadIfNeeded,
+            A.RandomCrop,
+            A.AtLeastOneBBoxRandomCrop,
+            A.Crop,
+            A.CenterCrop,
+            A.FDA,
+            A.HistogramMatching,
+            A.Lambda,
+            A.CropNonEmptyMaskIfExists,
+            A.BBoxSafeRandomCrop,
+            A.OverlayElements,
+            A.FromFloat,
+            A.MaskDropout,
+            A.XYMasking,
+            A.RandomCropNearBBox,
+            A.PiecewiseAffine,
+            A.Lambda,
+            A.RandomRotate90,
+            A.D4,
+            A.VerticalFlip,
+            A.HorizontalFlip,
+            A.Transpose,
+            A.Mosaic,
+            A.CopyAndPaste,
+            A.GuidedCoarseDropout,
+            A.BBoxSubsetSafeRandomCrop,
+        },
+    ),
+)
+def test_semantic_mask_interpolation(augmentation_cls, params, image):
+    """Checks whether transformations based on DualTransform does not introduce a mask interpolation artifacts."""
+    seed = 137
+    # Deep copy params to avoid mutating shared test parameters
+    params = copy.deepcopy(params)
+    params["mask_interpolation"] = cv2.INTER_NEAREST
+    params["fill_mask"] = 0
+
+    mask = cv2.randu(np.zeros((100, 100, 1), dtype=np.uint8), 0, 4) * 64
+
+    data = A.Compose([augmentation_cls(p=1, **params)], seed=seed, strict=False)(image=image, mask=mask)
+
+    np.testing.assert_array_equal(np.unique(data["mask"]), np.array([0, 64, 128, 192]))
+
+
+def __test_multiprocessing_support_proc(args):
+    x, transform = args
+    data = {"image": x}
+    if isinstance(transform, A.GuidedCoarseDropout):
+        data[transform.region_key] = np.ones(x.shape[:2], dtype=np.uint8)
+    return transform(**data)
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_2d_transform_params(
+        custom_arguments={},
+        except_augmentations={
+            A.RandomCropNearBBox,
+            A.RandomSizedBBoxSafeCrop,
+            A.BBoxSafeRandomCrop,
+            A.CropNonEmptyMaskIfExists,
+            A.FDA,
+            A.HistogramMatching,
+            A.PixelDistributionAdaptation,
+            A.OverlayElements,
+            A.MaskDropout,
+            A.Mosaic,
+            A.CopyAndPaste,
+            A.BBoxSubsetSafeRandomCrop,
+        },
+    ),
+)
+def test_multiprocessing_support(mp_pool, augmentation_cls, params):
+    """Checks whether we can use augmentations in multiprocessing environments"""
+    image = SQUARE_FLOAT_IMAGE if augmentation_cls == A.FromFloat else SQUARE_UINT8_IMAGE
+    aug = augmentation_cls(p=1, **params)
+
+    mp_pool.map(
+        __test_multiprocessing_support_proc,
+        ((x, aug) for x in [image] * 10),
+    )
+
+
+def test_force_apply():
+    """Unit test for https://github.com/albumentations-team/albumentations/issues/189"""
+    aug = A.Compose(
+        [
+            A.OneOrOther(
+                A.Compose(
+                    [
+                        A.RandomSizedCrop(
+                            min_max_height=(256, 1025),
+                            size=(512, 512),
+                            p=1,
+                        ),
+                        A.OneOf(
+                            [
+                                A.RandomSizedCrop(
+                                    min_max_height=(256, 512),
+                                    size=(384, 384),
+                                    p=0.5,
+                                ),
+                                A.RandomSizedCrop(
+                                    min_max_height=(256, 512),
+                                    size=(512, 512),
+                                    p=0.5,
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                A.Compose(
+                    [
+                        A.RandomSizedCrop(
+                            min_max_height=(256, 1025),
+                            size=(256, 256),
+                            p=1,
+                        ),
+                        A.OneOf([A.HueSaturationValue(p=0.5), A.RGBShift(p=0.7)], p=1),
+                    ],
+                ),
+            ),
+            A.HorizontalFlip(p=1),
+            A.RandomBrightnessContrast(p=0.5),
+        ],
+    )
+
+    res = aug(image=np.zeros((1248, 1248, 3), dtype=np.uint8))
+    assert res["image"].shape[0] in (256, 384, 512)
+    assert res["image"].shape[1] in (256, 384, 512)
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_image_only_transform_params(
+        except_augmentations={
+            A.FDA,
+            A.HistogramMatching,
+            A.PixelDistributionAdaptation,
+        },
+    ),
+)
+def test_additional_targets_for_image_only(augmentation_cls, params):
+    aug = A.Compose(
+        [augmentation_cls(p=1, **params)],
+        additional_targets={"image2": "image"},
+        strict=True,
+    )
+    # Reduced from 10 to 3 iterations - sufficient for randomness check
+    for _ in range(3):
+        image1 = SQUARE_FLOAT_IMAGE if augmentation_cls == A.FromFloat else SQUARE_UINT8_IMAGE
+        image2 = image1.copy()
+        res = aug(image=image1, image2=image2)
+        aug1 = res["image"]
+        aug2 = res["image2"]
+        np.testing.assert_array_equal(aug1, aug2)
+
+    aug = A.Compose([augmentation_cls(p=1, **params)], strict=True)
+    aug.add_targets(additional_targets={"image2": "image"})
+    # Reduced from 10 to 3 iterations - sufficient for randomness check
+    for _ in range(3):
+        image1 = SQUARE_FLOAT_IMAGE if augmentation_cls == A.FromFloat else SQUARE_UINT8_IMAGE
+        image2 = image1.copy()
+        res = aug(image=image1, image2=image2)
+        aug1 = res["image"]
+        aug2 = res["image2"]
+        np.testing.assert_array_equal(aug1, aug2)
+
+
+def test_resize_with_additional_targets_mask():
+    """Test that Resize works correctly with additional_targets for 2D masks.
+
+    Regression test for issue where 2D masks passed via additional_targets
+    would fail with IndexError due to chunking expecting 3D arrays.
+    """
+    image = np.zeros((256, 256, 3), dtype=np.uint8)
+    mask = np.ones((256, 256), dtype=np.uint8)
+
+    transform = A.Compose(
+        [A.Resize(height=512, width=512)],
+        additional_targets={"semantic_mask": "mask"},
+    )
+
+    augmented = transform(image=image, mask=mask, semantic_mask=mask.copy())
+
+    assert augmented["image"].shape == (512, 512, 3)
+    assert augmented["mask"].shape == (512, 512)
+    assert augmented["semantic_mask"].shape == (512, 512)
+    assert augmented["semantic_mask"].ndim == 2
+
+
+@pytest.mark.parametrize("seed", range(137, 140))  # Test with 3 different seeds instead of 10 iterations
+def test_image_invert(seed):
+    # test for np.uint8 dtype
+    np.random.seed(seed)
+    cv2.setRNGSeed(seed)
+    image1 = cv2.randu(np.zeros((100, 100, 3), dtype=np.uint8), 0, 255)
+    image2 = to_float(image1)
+    r_int = fpixel.invert(fpixel.invert(image1))
+    r_float = fpixel.invert(fpixel.invert(image2))
+    r_to_float = to_float(r_int)
+    np.testing.assert_allclose(r_float, r_to_float, atol=0.01, rtol=1e-5, equal_nan=False)
+
+
+def test_lambda_transform():
+    def negate_image(image, **kwargs):
+        return -image
+
+    def one_hot_mask(mask, num_channels, **kwargs):
+        m = mask[:, :, 0] if mask.ndim == 3 else mask
+        return np.eye(num_channels, dtype=np.uint8)[m]
+
+    def vflip_bboxes(bboxes, **kwargs):
+        return fgeometric.bboxes_vflip(bboxes, bbox_type=kwargs["bbox_type"])
+
+    def vflip_keypoints(keypoints, **kwargs):
+        return fgeometric.keypoints_vflip(keypoints, kwargs["shape"][0])
+
+    aug = A.Compose(
+        [
+            A.Lambda(
+                image=negate_image,
+                mask=partial(one_hot_mask, num_channels=16),
+                bboxes=vflip_bboxes,
+                keypoints=vflip_keypoints,
+                p=1,
+            ),
+        ],
+        bbox_params=A.BboxParams(coord_format="albumentations"),
+        keypoint_params=A.KeypointParams(coord_format="xyas", angle_in_degrees=False),
+    )
+
+    bboxes = np.array([[0.1, 0.1, 0.4, 0.5]])
+    keypoints = np.array([[2, 3, np.pi / 4, 5]])
+
+    height, width = 10, 10
+
+    image = np.ones((height, width, 3), dtype=np.float32)
+    # Use (H, W, 1) so Compose won't add channel dim; one_hot expects 2D indices
+    mask = np.tile(np.arange(0, height), (width, 1)).T.astype(np.uint8)[..., np.newaxis]
+
+    output = aug(
+        image=image,
+        mask=mask,
+        bboxes=bboxes,
+        keypoints=keypoints,
+    )
+
+    assert (output["image"] < 0).all()
+    assert output["mask"].shape[2] == 16  # num_channels
+    np.testing.assert_array_almost_equal(
+        output["bboxes"],
+        fgeometric.bboxes_vflip(np.array(bboxes), bbox_type="hbb"),
+    )
+    # Keypoints: vflip y and negate angle; Lambda receives albumentations format [x,y,z,angle,scale]
+    albu_kp = np.array([[2, 3, 0, np.pi / 4, 5]], dtype=np.float32)
+    flipped_albu = fgeometric.keypoints_vflip(albu_kp, height)
+    expected_xyas = np.column_stack([flipped_albu[:, 0], flipped_albu[:, 1], flipped_albu[:, 3], flipped_albu[:, 4]])
+    np.testing.assert_array_almost_equal(output["keypoints"], expected_xyas)
+
+
+def test_equalize():
+    aug = A.Equalize(p=1)
+
+    img = cv2.randu(np.zeros((256, 256, 3), dtype=np.uint8), 0, 255)
+    a = aug(image=img)["image"]
+    b = fpixel.equalize(img)
+    np.testing.assert_array_equal(a, b)
+
+    mask = cv2.randu(np.zeros((256, 256, 1), dtype=np.uint8), 0, 2)
+    aug = A.Equalize(mask=mask, p=1)
+    a = aug(image=img)["image"]
+    b = fpixel.equalize(img, mask=mask)
+    np.testing.assert_array_equal(a, b)
+
+    def mask_func(image, test):
+        return mask
+
+    aug = A.Equalize(mask=mask_func, mask_params=["test"], p=1)
+    np.testing.assert_array_equal(aug(image=img, test=mask)["image"], fpixel.equalize(img, mask=mask))
+
+
+@pytest.mark.parametrize("mode", ["linear", "corner", "gaussian"])
+def test_illumination_explicit_grayscale_channel(mode):
+    image = np.full((32, 32, 1), 137, dtype=np.uint8)
+    transform = A.Compose([A.Illumination(mode=mode, intensity_range=(0.1, 0.1), p=1)])
+
+    result = transform(image=image)["image"]
+
+    assert result.shape == image.shape
+    assert result.dtype == image.dtype
+
+
+@pytest.mark.parametrize(
+    ("mode", "params"),
+    [
+        ("linear", {"intensity": 0.13, "angle": 37.0, "corner": None, "center": None, "sigma": None, "spots": None}),
+        ("linear", {"intensity": -0.13, "angle": 37.0, "corner": None, "center": None, "sigma": None, "spots": None}),
+        ("corner", {"intensity": 0.13, "angle": None, "corner": 2, "center": None, "sigma": None, "spots": None}),
+        ("corner", {"intensity": -0.13, "angle": None, "corner": 2, "center": None, "sigma": None, "spots": None}),
+        (
+            "gaussian",
+            {"intensity": 0.13, "angle": None, "corner": None, "center": (0.37, 0.61), "sigma": 0.43, "spots": None},
+        ),
+        (
+            "gaussian",
+            {"intensity": -0.13, "angle": None, "corner": None, "center": (0.37, 0.61), "sigma": 0.43, "spots": None},
+        ),
+        (
+            "gaussian",
+            {
+                "intensity": None,
+                "angle": None,
+                "corner": None,
+                "center": None,
+                "sigma": None,
+                "spots": ((0.37, 0.61, 0.43, 0.13), (0.62, 0.42, 0.31, 0.08)),
+            },
+        ),
+        (
+            "gaussian",
+            {
+                "intensity": None,
+                "angle": None,
+                "corner": None,
+                "center": None,
+                "sigma": None,
+                "spots": ((0.37, 0.61, 0.43, 0.13), (0.62, 0.42, 0.31, -0.08)),
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+@pytest.mark.parametrize("channels", [None, 1, 3, 5])
+def test_illumination_batch_helper_matches_per_image(mode, params, dtype, channels):
+    rng = np.random.default_rng(137)
+    shape = (3, 24, 20) if channels is None else (3, 24, 20, channels)
+    images = rng.integers(0, 256, shape, dtype=np.uint8) if dtype == np.uint8 else rng.random(shape, dtype=np.float32)
+    transform = A.Illumination(mode=mode, p=1)
+    expected = np.stack([transform.apply(image, **params) for image in images])
+
+    actual = fpixel.apply_illumination_batch(images, mode, **params)
+    delegated = transform.apply_to_images(images, **params)
+
+    if dtype == np.float32:
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7, equal_nan=False)
+        np.testing.assert_allclose(delegated, actual, rtol=1e-6, atol=1e-7, equal_nan=False)
+    else:
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(delegated, actual)
+
+
+@pytest.mark.parametrize(
+    ("mode", "params"),
+    [
+        ("linear", {"intensity": 0.13, "angle": 37.0, "corner": None, "center": None, "sigma": None, "spots": None}),
+        ("corner", {"intensity": 0.13, "angle": None, "corner": 2, "center": None, "sigma": None, "spots": None}),
+        (
+            "gaussian",
+            {"intensity": 0.13, "angle": None, "corner": None, "center": (0.37, 0.61), "sigma": 0.43, "spots": None},
+        ),
+        (
+            "gaussian",
+            {
+                "intensity": None,
+                "angle": None,
+                "corner": None,
+                "center": None,
+                "sigma": None,
+                "spots": ((0.37, 0.61, 0.43, 0.13), (0.62, 0.42, 0.31, -0.08)),
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+@pytest.mark.parametrize("shape", [(0, 24, 20), (0, 24, 20, 5)])
+def test_illumination_empty_batch(mode, params, dtype, shape):
+    images = np.empty(shape, dtype=dtype)
+    transform = A.Illumination(mode=mode, p=1)
+
+    actual = fpixel.apply_illumination_batch(images, mode, **params)
+    delegated = transform.apply_to_images(images, **params)
+
+    assert actual.shape == images.shape
+    assert actual.dtype == images.dtype
+    assert delegated.shape == images.shape
+    assert delegated.dtype == images.dtype
+
+
+def test_illumination_default_gaussian_preserves_seeded_draw_order():
+    image = np.arange(24 * 20 * 3, dtype=np.uint8).reshape(24, 20, 3)
+    transform = A.Illumination(mode="gaussian", p=1)
+    pipeline = A.Compose([transform], seed=137, save_applied_params=True)
+
+    actual = pipeline(image=image)["image"]
+    expected_spot = (
+        0.8922037732150782,
+        0.28473780446259456,
+        0.4790219963198539,
+        -0.02374964911119945,
+    )
+    expected = fpixel.apply_gaussian_illumination(
+        image,
+        expected_spot[3],
+        expected_spot[:2],
+        expected_spot[2],
+    )
+
+    applied_params = SampledParams.from_dict(transform.get_applied_params()).params
+    assert applied_params["intensity"] == expected_spot[3]
+    assert applied_params["center"] == expected_spot[:2]
+    assert applied_params["sigma"] == expected_spot[2]
+    assert transform.get_applied_config()["gaussian_spots"] == (expected_spot,)
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+def test_illumination_multiple_gaussian_spots_share_field_across_targets(dtype):
+    image = np.full((24, 20, 3), 127, dtype=np.uint8)
+    if dtype == np.float32:
+        image = image.astype(np.float32) / 255
+    images = np.stack([image, image])
+    volume = np.stack([image, image])
+    transform = A.Compose(
+        [A.Illumination(mode="gaussian", num_spots_range=(3, 3), effect_type="both", p=1)],
+        seed=137,
+    )
+
+    result = transform(image=image, images=images, volume=volume)
+
+    assert result["image"].dtype == dtype
+    assert result["images"].dtype == dtype
+    assert result["volume"].dtype == dtype
+    assert np.min(result["image"]) >= 0
+    assert np.max(result["image"]) <= (255 if dtype == np.uint8 else 1)
+    np.testing.assert_array_equal(result["images"][0], result["image"])
+    np.testing.assert_array_equal(result["volume"][0], result["image"])
+
+
+def test_illumination_multiple_gaussian_spots_applied_config_json_round_trip():
+    image = np.full((24, 20, 3), 127, dtype=np.uint8)
+    transform = A.Compose(
+        [A.Illumination(mode="gaussian", num_spots_range=(2, 4), effect_type="both", p=1)],
+        seed=137,
+        save_applied_params=True,
+        strict=True,
+    )
+
+    result = transform(image=image)
+    transported = json.loads(json.dumps(result["applied_transforms"], allow_nan=False))
+    config = transported[0][1]
+    replay = A.Compose.from_applied_transforms(transported, strict=True)
+
+    assert config["num_spots_range"] == len(config["gaussian_spots"])
+    assert all(len(spot) == 4 for spot in config["gaussian_spots"])
+    np.testing.assert_array_equal(replay(image=image)["image"], result["image"])
+
+
+def test_illumination_both_samples_each_gaussian_spot_effect_independently():
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    transform = A.Illumination(mode="gaussian", num_spots_range=(3, 3), effect_type="both", p=1)
+    pipeline = A.Compose([transform], seed=137, save_applied_params=True)
+
+    pipeline(image=image)
+    applied_params = SampledParams.from_dict(transform.get_applied_params()).params
+    signs = [spot[3] > 0 for spot in applied_params["spots"]]
+
+    assert signs == [False, True, True]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error_pattern"),
+    [
+        ({"num_spots_range": (0, 1)}, "must be >= 1"),
+        ({"num_spots_range": (3, 2)}, "First value should be less than"),
+        ({"mode": "linear", "num_spots_range": (2, 2)}, "only be changed for gaussian mode"),
+        ({"mode": "gaussian", "gaussian_spots": ()}, "must contain at least one spot"),
+        (
+            {"mode": "gaussian", "num_spots_range": (2, 2), "gaussian_spots": ((0.5, 0.5, 0.3, 0.1),)},
+            "must equal the number",
+        ),
+        (
+            {"mode": "gaussian", "gaussian_spots": ((1.1, 0.5, 0.3, 0.1),)},
+            "centers must be in",
+        ),
+        (
+            {"mode": "gaussian", "gaussian_spots": ((0.5, 0.5, 0.1, 0.1),)},
+            "sigma must be in",
+        ),
+        (
+            {"mode": "gaussian", "gaussian_spots": ((0.5, 0.5, 0.3, 0.5),)},
+            "intensity magnitude must be in",
+        ),
+    ],
+)
+def test_illumination_multiple_gaussian_spots_validation(kwargs, error_pattern):
+    with pytest.raises(ValueError, match=error_pattern):
+        A.Illumination(**kwargs, strict=True)
+
+
+def test_crop_non_empty_mask():
+    def _test_crop(mask, crop, aug, n=1):
+        for _ in range(n):
+            augmented = aug(image=mask, mask=mask)
+            np.testing.assert_array_equal(augmented["image"], crop)
+            np.testing.assert_array_equal(augmented["mask"], crop)
+
+    # test general case
+    mask_1 = np.zeros([10, 10], dtype=np.uint8)
+    mask_1[0, 0] = 1
+    crop_1 = np.array([[1]])
+    aug_1 = A.CropNonEmptyMaskIfExists(1, 1)
+
+    # test empty mask
+    mask_2 = np.zeros([10, 10], dtype=np.uint8)
+    crop_2 = np.array([[0]])
+    aug_2 = A.CropNonEmptyMaskIfExists(1, 1)
+
+    # test ignore values
+    mask_3 = np.ones([2, 2])
+    mask_3[0, 0] = 2
+    crop_3 = np.array([[2]])
+    aug_3 = A.CropNonEmptyMaskIfExists(1, 1, ignore_values=[1])
+
+    # test ignore channels
+    mask_4 = np.zeros([2, 2, 2])
+    mask_4[0, 0, 0] = 1
+    mask_4[1, 1, 1] = 2
+    crop_4 = np.array([[[1, 0]]])
+    aug_4 = A.CropNonEmptyMaskIfExists(1, 1, ignore_channels=[1])
+
+    # test full size crop
+    mask_5 = np.random.random([10, 10, 3])
+    crop_5 = mask_5
+    aug_5 = A.CropNonEmptyMaskIfExists(10, 10)
+
+    mask_6 = np.zeros([10, 10, 3])
+    mask_6[0, 0, 0] = 0
+    crop_6 = mask_6
+    aug_6 = A.CropNonEmptyMaskIfExists(10, 10, ignore_values=[1])
+
+    _test_crop(mask_1, crop_1, aug_1, n=1)
+    _test_crop(mask_2, crop_2, aug_2, n=1)
+    _test_crop(mask_3, crop_3, aug_3, n=5)
+    _test_crop(mask_4, crop_4, aug_4, n=5)
+    _test_crop(mask_5, crop_5, aug_5, n=1)
+    _test_crop(mask_6, crop_6, aug_6, n=10)
+
+
+def test_crop_non_empty_mask_if_exists_handles_opencv_find_non_zero_shape():
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[3, 4] = 1
+    transform = A.Compose([A.CropNonEmptyMaskIfExists(height=1, width=1, p=1)], seed=137)
+
+    result = transform(image=image, mask=mask)
+
+    np.testing.assert_array_equal(result["mask"], np.array([[1]], dtype=np.uint8))
+
+
+def test_crop_non_empty_mask_if_exists_handles_multichannel_find_non_zero_shape():
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+    mask = np.zeros((8, 8, 2), dtype=np.uint8)
+    mask[3, 4, 1] = 5
+    transform = A.Compose([A.CropNonEmptyMaskIfExists(height=1, width=1, p=1)], seed=137)
+
+    result = transform(image=image, mask=mask)
+
+    np.testing.assert_array_equal(result["mask"], np.array([[[0, 5]]], dtype=np.uint8))
+
+
+@pytest.mark.parametrize(
+    "images",
+    [
+        cv2.randu(np.zeros((2, 256, 320, 1), dtype=np.uint8), 0, 255),
+        cv2.randu(np.zeros((2, 256, 320, 1), dtype=np.float32), 0, 1),
+        cv2.randu(np.zeros((2, 256, 320, 3), dtype=np.uint8), 0, 255),
+        cv2.randu(np.zeros((2, 256, 320, 3), dtype=np.float32), 0, 1),
+    ],
+)
+def test_batched_multiplicative_noise(images: np.ndarray):
+    m = 0.5
+    aug = A.MultiplicativeNoise((m, m), p=1)
+
+    actual = aug.apply_to_images(images, m)
+
+    assert actual.shape == images.shape
+
+    expected = aug(image=images[0])["image"]
+    assert not np.array_equal(images[0], expected)
+    np.testing.assert_allclose(actual[0], expected)
+
+    expected = aug(image=images[1])["image"]
+    assert not np.array_equal(images[1], expected)
+    np.testing.assert_allclose(actual[1], expected)
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        cv2.randu(np.zeros((256, 320, 1), dtype=np.uint8), 0, 255),
+        cv2.randu(np.zeros((256, 320, 1), dtype=np.float32), 0, 1),
+    ],
+)
+def test_multiplicative_noise_grayscale(image):
+    m = 0.5
+    aug = A.MultiplicativeNoise((m, m), elementwise=False, p=1)
+    data = {"image": image}
+    sampled_params = aug.sample_parameters(
+        *make_sampling_args(aug, data),
+        sampling=SamplingContext.from_owner(aug, {}),
+    )
+    params = sampled_params.params_for("image")
+    assert m == params["multiplier"]
+    result_e = aug(image=image)["image"]
+
+    expected = image.astype(np.float32) * params["multiplier"]
+
+    np.testing.assert_allclose(clip(expected, image.dtype), result_e, rtol=1e-5, atol=1e-8, equal_nan=False)
+
+    aug = A.MultiplicativeNoise((m, m), elementwise=True, p=1)
+    sampled_params = aug.sample_parameters(
+        *make_sampling_args(aug, data),
+        sampling=SamplingContext.from_owner(aug, {}),
+    )
+    params = sampled_params.params_for("image")
+    result_ne = aug.apply(image, params["multiplier"])
+
+    expected = image.astype(np.float32) * params["multiplier"]
+
+    np.testing.assert_allclose(clip(expected, image.dtype), result_ne, rtol=1e-5, atol=1e-8, equal_nan=False)
+
+
+@pytest.mark.parametrize(
+    "image",
+    IMAGES,
+)
+@pytest.mark.parametrize(
+    "elementwise",
+    (True, False),
+)
+def test_multiplicative_noise_rgb(image, elementwise):
+    dtype = image.dtype
+
+    aug = A.MultiplicativeNoise(multiplier=(0.9, 1.1), elementwise=elementwise, p=1)
+    data = {"image": image}
+    sampled_params = aug.sample_parameters(
+        *make_sampling_args(aug, data),
+        sampling=SamplingContext.from_owner(aug, {}),
+    )
+    mul = sampled_params.params_for("image")["multiplier"]
+
+    if elementwise:
+        assert mul.shape == (*image.shape[:2], 1)
+    else:
+        assert np.isscalar(mul)
+
+    result = aug.apply(image, mul)
+
+    expected = image.astype(np.float32) * mul
+
+    np.testing.assert_allclose(clip(expected, dtype), result, atol=1e-5, rtol=1e-5, equal_nan=False)
+
+
+def test_mask_dropout():
+    # In this case we have mask with all ones, so MaskDropout wipe entire mask and image
+    img = cv2.randu(np.zeros((50, 10, 3), dtype=np.uint8), 0, 255)
+    mask = np.ones((50, 10, 1), dtype=np.int64)
+
+    aug = A.MaskDropout(p=1)
+    result = aug(image=img, mask=mask)
+    np.testing.assert_array_equal(result["image"], 0)
+    np.testing.assert_array_equal(result["mask"], 0)
+
+    # In this case we have mask with zeros , so MaskDropout will make no changes
+    img = cv2.randu(np.zeros((50, 10, 3), dtype=np.uint8), 0, 255)
+    mask = np.zeros((50, 10, 1), dtype=np.int64)
+
+    aug = A.MaskDropout(p=1)
+    result = aug(image=img, mask=mask)
+    np.testing.assert_array_equal(result["image"], img)
+    np.testing.assert_array_equal(result["mask"], 0)
+
+
+@pytest.mark.parametrize("fill", ["inpaint_telea", "inpaint_ns"])
+def test_mask_dropout_inpaint_fill(fill):
+    img = np.full((20, 20, 3), 137, dtype=np.uint8)
+    mask = np.zeros((20, 20, 1), dtype=np.int64)
+    mask[5:15, 5:15] = 1
+
+    aug = A.MaskDropout(max_objects_range=(1, 1), fill=fill, fill_mask=0, p=1)
+    result = aug(image=img, mask=mask)
+
+    assert result["image"].shape == img.shape
+    assert result["image"].dtype == img.dtype
+    np.testing.assert_array_equal(result["mask"], 0)
+
+
+@pytest.mark.parametrize("fill", ["inpaint_telea", "inpaint_ns"])
+def test_mask_dropout_inpaint_fill_tiny_mask(fill):
+    img = np.full((5, 5, 3), 137, dtype=np.uint8)
+    mask = np.zeros((5, 5, 1), dtype=np.int64)
+    mask[2, 2] = 1
+
+    aug = A.MaskDropout(max_objects_range=(1, 1), fill=fill, fill_mask=0, p=1)
+    result = aug(image=img, mask=mask)
+
+    assert result["image"].shape == img.shape
+    assert result["image"].dtype == img.dtype
+    np.testing.assert_array_equal(result["mask"], 0)
+
+
+@pytest.mark.parametrize("val_uint8", [0, 1, 128, 255])
+def test_unsharp_mask_float_uint8_diff_less_than_three(val_uint8):
+    x_uint8 = np.zeros((5, 5, 3)).astype(np.uint8)
+    x_uint8[2, 2] = val_uint8
+
+    x_float32 = np.zeros((5, 5, 3)).astype(np.float32)
+    x_float32[2, 2] = val_uint8 / 255.0
+
+    unsharpmask = A.UnsharpMask(blur_range=(3, 3), p=1)
+    unsharpmask.set_random_seed(0)
+
+    usm_uint8 = unsharpmask(image=x_uint8)["image"]
+
+    usm_float32 = unsharpmask(image=x_float32)["image"]
+
+    # Before comparison, rescale the usm_float32 to [0, 255]
+    diff = np.abs(usm_uint8 - usm_float32 * 255)
+
+    # The fast uint8 OpenCV path can differ slightly from float32 due to integer rounding.
+    assert np.all(diff <= 3.0), f"Max difference: {diff.max()}"
+
+
+@pytest.mark.parametrize(
+    ["brightness", "contrast", "saturation", "hue"],
+    [
+        [1, 1, 1, 0],
+        [0.123, 1, 1, 0],
+        [1.321, 1, 1, 0],
+        [1, 0.234, 1, 0],
+        [1, 1.432, 1, 0],
+        [1, 1, 0.345, 0],
+        [1, 1, 1.543, 0],
+        [1, 1, 1, 0.456],
+        [1, 1, 1, -0.432],
+    ],
+)
+def test_color_jitter_float_uint8_equal(brightness, contrast, saturation, hue):
+    img = SQUARE_UINT8_IMAGE
+
+    transform = A.Compose(
+        [
+            A.ColorJitter(
+                brightness_range=[brightness, brightness],
+                contrast_range=[contrast, contrast],
+                saturation_range=[saturation, saturation],
+                hue_range=[hue, hue],
+                p=1,
+            ),
+        ],
+        seed=137,
+        strict=True,
+    )
+
+    res1 = transform(image=img)["image"]
+    res2 = (transform(image=img.astype(np.float32) / 255.0)["image"] * 255).astype(
+        np.uint8,
+    )
+
+    _max = np.abs(res1.astype(np.int16) - res2.astype(np.int16)).max()
+
+    if hue != 0:
+        assert _max <= 10, f"Max: {_max}"
+    else:
+        assert _max <= 2, f"Max: {_max}"
+
+
+@pytest.mark.parametrize(
+    ("transform_class", "message"),
+    [
+        (A.ColorJitter, "ColorJitter transformation expects 1-channel or 3-channel images."),
+        (A.PhotoMetricDistort, "PhotoMetricDistort expects 1-channel or 3-channel images."),
+    ],
+)
+def test_color_transforms_validate_channel_contract_in_apply(transform_class, message):
+    with pytest.raises(TypeError, match=message):
+        transform_class(p=1)(image=np.zeros((8, 8, 2), dtype=np.uint8))
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+def test_random_brightness_contrast_torchvision_mode_matches_expected_formula(dtype):
+    if dtype == np.uint8:
+        image = np.array([[[50], [100], [150]]], dtype=dtype)
+        expected = np.array([[[30], [120], [210]]], dtype=dtype)
+    else:
+        image = np.array([[[0.2], [0.4], [0.6]]], dtype=dtype)
+        expected = np.array([[[0.12], [0.48], [0.84]]], dtype=dtype)
+
+    transform = A.RandomBrightnessContrast(
+        brightness_range=(0.2, 0.2),
+        contrast_range=(0.5, 0.5),
+        brightness_by_max=False,
+        p=1,
+    )
+
+    result = transform(image=image)["image"]
+
+    np.testing.assert_allclose(result, expected, atol=1e-6)
+
+
+def test_random_brightness_contrast_defaults_to_torchvision_semantics():
+    image = np.array([[[50], [100], [150]]], dtype=np.uint8)
+    transform = A.RandomBrightnessContrast(
+        brightness_range=(0.2, 0.2),
+        contrast_range=(0.5, 0.5),
+        p=1,
+    )
+
+    result = transform(image=image)["image"]
+
+    np.testing.assert_array_equal(result, np.array([[[30], [120], [210]]], dtype=np.uint8))
+
+
+def test_random_brightness_contrast_torchvision_mode_uses_per_image_batch_means():
+    images = np.array(
+        [
+            [[[0], [100]]],
+            [[[100], [200]]],
+        ],
+        dtype=np.uint8,
+    )
+    expected = np.array(
+        [
+            [[[50], [50]]],
+            [[[150], [150]]],
+        ],
+        dtype=np.uint8,
+    )
+    transform = A.RandomBrightnessContrast(
+        brightness_range=(0, 0),
+        contrast_range=(-1, -1),
+        brightness_by_max=False,
+        p=1,
+    )
+
+    result = transform(images=images)["images"]
+
+    np.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize("target", ["images", "volume"])
+@pytest.mark.parametrize(
+    ("method", "cutoff", "ignore"),
+    [
+        ("cdf", 0, None),
+        ("pil", 0, None),
+        ("cdf", 5, 0),
+        ("pil", 5, 0),
+    ],
+)
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+@pytest.mark.parametrize("num_channels", [1, 3, 5])
+def test_auto_contrast_batch_matches_per_image(
+    target: str,
+    method: str,
+    cutoff: float,
+    ignore: int | None,
+    dtype: type[np.generic],
+    num_channels: int,
+) -> None:
+    histograms = np.array(
+        [
+            [0] * 4 + [10] + [40] * 14 + [90] * 16 + [150] * 16 + [220] * 12 + [250],
+            [0] * 8 + [30] + [60] * 10 + [100] * 14 + [140] * 16 + [190] * 14 + [245],
+        ],
+        dtype=np.uint8,
+    ).reshape(2, 8, 8, 1)
+    data = np.repeat(histograms, num_channels, axis=-1)
+    if dtype == np.float32:
+        data = data.astype(np.float32) / 255.0
+    transform = A.Compose(
+        [A.AutoContrast(cutoff=cutoff, ignore=ignore, method=method, p=1.0)],
+        seed=137,
+        strict=True,
+    )
+
+    actual = transform(**{target: data})[target]
+    expected = np.stack([transform(image=image)["image"] for image in data])
+
+    np.testing.assert_array_equal(actual, expected)
+
+    if ignore is not None:
+        without_ignore = A.Compose(
+            [A.AutoContrast(cutoff=cutoff, ignore=None, method=method, p=1.0)],
+            seed=137,
+            strict=True,
+        )(**{target: data})[target]
+        assert not np.array_equal(actual, without_ignore)
+
+        if num_channels > 1:
+            without_cutoff = A.Compose(
+                [A.AutoContrast(cutoff=0, ignore=ignore, method=method, p=1.0)],
+                seed=137,
+                strict=True,
+            )(**{target: data})[target]
+            assert not np.array_equal(actual, without_cutoff)
+
+
+@pytest.mark.parametrize("target", ["images", "volume"])
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+def test_auto_contrast_preserves_empty_batch(target: str, dtype: type[np.generic]) -> None:
+    data = np.empty((0, 4, 6, 3), dtype=dtype)
+    transform = A.Compose([A.AutoContrast(p=1.0)], seed=137, strict=True)
+
+    result = transform(**{target: data})[target]
+
+    assert result.shape == data.shape
+    assert result.dtype == data.dtype
+
+
+@pytest.mark.parametrize("target", ["images", "volume"])
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+def test_auto_contrast_batch_handles_non_contiguous_read_only_input(
+    target: str,
+    dtype: type[np.generic],
+) -> None:
+    rng = np.random.default_rng(137)
+    source = rng.integers(0, 256, (2, 4, 12, 3), dtype=np.uint8)
+    if dtype == np.float32:
+        source = source.astype(np.float32) / 255.0
+    data = source[:, :, ::2, :]
+    data.setflags(write=False)
+    data_before = data.copy()
+    transform = A.Compose([A.AutoContrast(p=1.0)], seed=137, strict=True)
+
+    actual = transform(**{target: data})[target]
+    expected = np.stack([transform(image=image)["image"] for image in data])
+
+    np.testing.assert_array_equal(data, data_before)
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("target", ["images", "volume"])
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+@pytest.mark.parametrize(
+    "transform_factory",
+    [
+        partial(A.PlasmaBrightnessContrast, brightness_range=(0.2, 0.2), contrast_range=(0.3, 0.3), p=1.0),
+        partial(A.PlasmaShadow, shadow_intensity_range=(0.4, 0.4), p=1.0),
+        partial(A.HEStain, method="preset", preset="standard", p=1.0),
+        partial(A.RandomGridShuffle, grid=(2, 3), p=1.0),
+    ],
+)
+def test_removed_batch_transform_routes_match_per_image(
+    target: str,
+    dtype: type[np.generic],
+    transform_factory: Callable[[], BasicTransform],
+) -> None:
+    source = np.random.default_rng(137).integers(0, 256, (2, 8, 12, 3), dtype=np.uint8)
+    data = source[:, :, ::2, :]
+    if dtype == np.float32:
+        data = data.astype(np.float32) / 255.0
+    data.setflags(write=False)
+    data_before = data.copy()
+
+    actual = A.Compose([transform_factory()], seed=137, strict=True)(**{target: data})[target]
+    expected = np.stack(
+        [A.Compose([transform_factory()], seed=137, strict=True)(image=image)["image"] for image in data],
+    )
+
+    np.testing.assert_array_equal(data, data_before)
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_random_brightness_contrast_torchvision_mode_safe_output_uses_combined_coefficients():
+    image = np.array([[[50], [100], [150]]], dtype=np.uint8)
+    transform = A.RandomBrightnessContrast(
+        brightness_range=(0.2, 0.2),
+        contrast_range=(0.5, 0.5),
+        brightness_by_max=False,
+        ensure_safe_output=True,
+        p=1,
+    )
+
+    result = transform(image=image)["image"]
+
+    np.testing.assert_array_equal(result, image)
+
+
+def test_random_brightness_contrast_max_mode_preserves_opencv_formula():
+    image = np.full((2, 2, 3), 100, dtype=np.uint8)
+    transform = A.RandomBrightnessContrast(
+        brightness_range=(0.2, 0.2),
+        contrast_range=(0, 0),
+        brightness_by_max=True,
+        p=1,
+    )
+
+    result = transform(image=image)["image"]
+
+    np.testing.assert_array_equal(result, np.full_like(image, 151))
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+@pytest.mark.parametrize(
+    ("target", "shape"),
+    [
+        ("image", (2, 2, 3)),
+        ("images", (2, 2, 2, 3)),
+        ("volume", (2, 2, 2, 3)),
+    ],
+)
+def test_random_brightness_contrast_max_mode_clips_normalized_float_outputs(
+    dtype: type[np.uint8] | type[np.float32],
+    target: str,
+    shape: tuple[int, ...],
+) -> None:
+    transform = A.RandomBrightnessContrast(
+        brightness_range=(-0.15, -0.15),
+        contrast_range=(0, 0),
+        brightness_by_max=True,
+        p=1,
+    )
+
+    result = transform(**{target: np.zeros(shape, dtype=dtype)})[target]
+
+    np.testing.assert_array_equal(result, np.zeros_like(result))
+
+
+@pytest.mark.parametrize(
+    "transform_kwargs",
+    [
+        {"brightness_range": (-1.1, 0.2)},
+        {"brightness_range": (0.2, -1.1)},
+        {"contrast_range": (-1.1, 0.2)},
+        {"contrast_range": (0.2, -1.1)},
+    ],
+)
+def test_random_brightness_contrast_torchvision_mode_rejects_negative_factors(
+    transform_kwargs: dict[str, tuple[float, float]],
+) -> None:
+    with pytest.raises(ValueError, match="must be greater than or equal to -1"):
+        A.RandomBrightnessContrast(**transform_kwargs)
+
+
+def test_random_brightness_contrast_max_mode_allows_adjustments_below_negative_one() -> None:
+    transform = A.RandomBrightnessContrast(
+        brightness_range=(-1.2, -1.1),
+        contrast_range=(-1.4, -1.3),
+        brightness_by_max=True,
+    )
+
+    assert transform.brightness_range == (-1.2, -1.1)
+    assert transform.contrast_range == (-1.4, -1.3)
+
+
+def test_perspective_keep_size():
+    height, width = 100, 100
+    img = np.zeros([height, width, 3], dtype=np.uint8)
+    bboxes = []
+    for _ in range(10):
+        x1 = np.random.randint(0, width - 1)
+        y1 = np.random.randint(0, height - 1)
+        x2 = np.random.randint(x1 + 1, width)
+        y2 = np.random.randint(y1 + 1, height)
+        bboxes.append([x1, y1, x2, y2])
+    keypoints = [(np.random.randint(0, width), np.random.randint(0, height), np.random.random()) for _ in range(10)]
+
+    transform_1 = A.Compose(
+        [A.Perspective(keep_size=True, p=1)],
+        keypoint_params=A.KeypointParams("xys"),
+        bbox_params=A.BboxParams("pascal_voc", label_fields=["labels"]),
+        seed=137,
+        strict=True,
+    )
+
+    res_1 = transform_1(
+        image=img,
+        bboxes=bboxes,
+        keypoints=keypoints,
+        labels=[0] * len(bboxes),
+    )
+
+    transform_2 = A.Compose(
+        [A.Perspective(keep_size=False, p=1), A.Resize(height, width, p=1)],
+        keypoint_params=A.KeypointParams("xys"),
+        bbox_params=A.BboxParams("pascal_voc", label_fields=["labels"]),
+        seed=137,
+        strict=True,
+    )
+
+    res_2 = transform_2(
+        image=img,
+        bboxes=bboxes,
+        keypoints=keypoints,
+        labels=[0] * len(bboxes),
+    )
+
+    np.testing.assert_allclose(res_1["bboxes"], res_2["bboxes"], atol=0.2, rtol=1e-5, equal_nan=False)
+
+    assert res_1["image"].shape == img.shape
+
+
+def test_perspective_keep_size_keypoints_follow_single_warp() -> None:
+    image = np.zeros((8, 10), dtype=np.uint8)
+    image[3, 2] = 255
+    matrix = np.diag([2, 2, 1]).astype(np.float32)
+
+    transformed_image = fgeometric.perspective(image, matrix, 20, 16, 0, cv2.BORDER_CONSTANT, True, cv2.INTER_NEAREST)
+    transformed_keypoints = fgeometric.perspective_keypoints(
+        np.array([[2, 3, 0, 0, 1]], dtype=np.float32),
+        image.shape,
+        matrix,
+        20,
+        16,
+        True,
+    )
+
+    np.testing.assert_array_equal(transformed_image, image)
+    np.testing.assert_allclose(transformed_keypoints[0, :2], [2, 3])
+
+
+def test_longest_max_size_list():
+    img = cv2.randu(np.zeros((50, 10, 1), dtype=np.uint8), 0, 255)
+    keypoints = np.array([(9, 5, 33, 0, 0)])
+
+    aug = A.LongestMaxSize(max_size=[5, 10], p=1)
+    result = aug(image=img, keypoints=keypoints)
+    assert result["image"].shape in [(10, 2, 1), (5, 1, 1)]
+    expected = {(10, 2, 1): (1.4, 0.6, 33, 0, 0), (5, 1, 1): (0.45, 0.05, 33, 0, 0)}[result["image"].shape]
+    np.testing.assert_allclose(result["keypoints"][0], expected)
+
+
+def test_smallest_max_size_list():
+    img = cv2.randu(np.zeros((50, 10, 1), dtype=np.uint8), 0, 255)
+    keypoints = np.array([(9, 5, 33, 0, 0)])
+
+    aug = A.SmallestMaxSize(max_size=[50, 100], p=1)
+    result = aug(image=img, keypoints=keypoints)
+    assert result["image"].shape in [(250, 50, 1), (500, 100, 1)]
+    expected = {(250, 50, 1): (47, 27, 33, 0, 0), (500, 100, 1): (94.5, 54.5, 33, 0, 0)}[result["image"].shape]
+    np.testing.assert_allclose(result["keypoints"][0], expected)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"scale": (0.5, 1.0)},
+        {"scale": (0.5, 1.0), "keep_ratio": False},
+        {"scale": (0.5, 1.0), "keep_ratio": True},
+    ],
+)
+def test_affine_scale_ratio(params):
+    aug = A.Affine(**params, p=1.0)
+    aug.set_random_seed(0)
+
+    image = SQUARE_UINT8_IMAGE
+
+    data = {"image": image}
+    apply_params = aug.sample_parameters(
+        *make_sampling_args(aug, data),
+        sampling=SamplingContext.from_owner(aug, {}),
+    ).params
+
+    if "keep_ratio" not in params:
+        # Default keep_ratio is True
+        assert apply_params["scale"]["x"] == apply_params["scale"]["y"]
+    elif not params["keep_ratio"]:
+        # With keep_ratio=False, scales can differ
+        assert apply_params["scale"]["x"] != apply_params["scale"]["y"]
+    else:
+        # With keep_ratio=True, scales must be equal
+        assert apply_params["scale"]["x"] == apply_params["scale"]["y"]
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"scale": {"x": (0.5, 1.0), "y": (1.0, 1.5)}, "keep_ratio": True},
+        {"scale": {"x": 0.5, "y": 1.0}, "keep_ratio": True},
+    ],
+)
+def test_affine_incorrect_scale_range(params):
+    with pytest.raises(ValueError):
+        A.Affine(**params)
+
+
+def test_affine_default_keep_ratio_behavior():
+    """Test that Affine transform preserves aspect ratio by default (keep_ratio=True)."""
+    # Test with tuple scale
+    transform = A.Affine(scale=(0.5, 1.5), p=1.0)
+    assert transform.keep_ratio, "Default keep_ratio should be True"
+
+    transform.set_random_seed(137)
+    image = SQUARE_UINT8_IMAGE
+    data = {"image": image}
+    apply_params = transform.sample_parameters(
+        *make_sampling_args(transform, data),
+        sampling=SamplingContext.from_owner(transform, {}),
+    ).params
+
+    assert apply_params["scale"]["x"] == apply_params["scale"]["y"], (
+        f"With default keep_ratio=True, scales should be equal "
+        f"but got x={apply_params['scale']['x']}, y={apply_params['scale']['y']}"
+    )
+
+
+def test_affine_explicit_keep_ratio_false():
+    """Test that setting keep_ratio=False allows different x/y scales."""
+    transform = A.Affine(scale=(0.5, 1.5), keep_ratio=False, p=1.0)
+    assert not transform.keep_ratio, "keep_ratio should be False when explicitly set"
+
+    transform.set_random_seed(137)
+    image = SQUARE_UINT8_IMAGE
+    data = {"image": image}
+    apply_params = transform.sample_parameters(
+        *make_sampling_args(transform, data),
+        sampling=SamplingContext.from_owner(transform, {}),
+    ).params
+
+    # With keep_ratio=False, x and y can be different (not always will be, but can be)
+    # Let's test multiple seeds to ensure we get different values at least once
+    found_different = False
+    for seed in range(10):
+        transform.set_random_seed(seed)
+        apply_params = transform.sample_parameters(
+            *make_sampling_args(transform, data),
+            sampling=SamplingContext.from_owner(transform, {}),
+        ).params
+        if apply_params["scale"]["x"] != apply_params["scale"]["y"]:
+            found_different = True
+            break
+
+    assert found_different, "With keep_ratio=False, should be able to get different x and y scales"
+
+
+def test_affine_with_dict_scale_keep_ratio_true():
+    """Test that dict scale with same ranges and keep_ratio=True works correctly."""
+    transform = A.Affine(
+        scale={"x": (0.5, 1.5), "y": (0.5, 1.5)},
+        keep_ratio=True,
+        p=1.0,
+    )
+    transform.set_random_seed(137)
+    image = SQUARE_UINT8_IMAGE
+    data = {"image": image}
+    apply_params = transform.sample_parameters(
+        *make_sampling_args(transform, data),
+        sampling=SamplingContext.from_owner(transform, {}),
+    ).params
+
+    assert apply_params["scale"]["x"] == apply_params["scale"]["y"], (
+        "With keep_ratio=True and dict scale, x and y should be equal"
+    )
+
+
+def test_safe_rotate_inherits_keep_ratio_default():
+    """Test that SafeRotate inherits the new default keep_ratio=True behavior."""
+    transform = A.SafeRotate(angle_range=(-45, 45), p=1.0)
+    # SafeRotate inherits from Affine and doesn't override keep_ratio
+    assert transform.keep_ratio, "SafeRotate should inherit keep_ratio=True default"
+
+
+def test_affine_keep_ratio_with_single_scale_value():
+    """Test that a single scale value works correctly with keep_ratio=True."""
+    transform = A.Affine(scale=(1.5, 1.5), keep_ratio=True, p=1.0)
+    transform.set_random_seed(137)
+    image = SQUARE_UINT8_IMAGE
+    data = {"image": image}
+    apply_params = transform.sample_parameters(
+        *make_sampling_args(transform, data),
+        sampling=SamplingContext.from_owner(transform, {}),
+    ).params
+
+    # With a single scale value, both x and y should be that value
+    assert apply_params["scale"]["x"] == 1.5, f"Expected scale_x=1.5 but got {apply_params['scale']['x']}"
+    assert apply_params["scale"]["y"] == 1.5, f"Expected scale_y=1.5 but got {apply_params['scale']['y']}"
+
+
+def test_shift_scale_rotate_uses_keep_ratio_true_without_warning() -> None:
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        transform = A.ShiftScaleRotate(
+            shift_range=(0.1, 0.1),
+            scale_range=(-0.1, 0.1),
+            rotate_range=(45, 45),
+            p=1.0,
+        )
+
+    assert transform.keep_ratio
+    assert caught == []
+
+
+@pytest.mark.parametrize(
+    ["angle", "targets", "expected"],
+    [
+        [
+            -10,
+            {
+                "bboxes": [
+                    [0, 0, 5, 5, 0],
+                    [195, 0, 200, 5, 0],
+                    [195, 95, 200, 100, 0],
+                    [0, 95, 5, 99, 0],
+                ],
+                "keypoints": [
+                    [0, 0, 0, 0],
+                    [199, 0, 10, 8.72],
+                    [199, 99, 20, 17.46],
+                    [0, 99, 30, 26.19],
+                ],
+            },
+            {
+                "bboxes": [
+                    [
+                        15.264852523803711,
+                        0.0,
+                        20.678197860717773,
+                        4.27599573135376,
+                        0.0,
+                    ],
+                    [
+                        194.73916625976562,
+                        25.38059425354004,
+                        200.0,
+                        29.73569107055664,
+                        0.0,
+                    ],
+                    [
+                        179.32180786132812,
+                        95.72400665283203,
+                        184.7351531982422,
+                        100.0,
+                        0.0,
+                    ],
+                    [
+                        0.009779278188943863,
+                        70.2643051147461,
+                        5.260837078094482,
+                        73.87895202636719,
+                        0.0,
+                    ],
+                ],
+                "keypoints": [
+                    [16.455339431762695, 0.35640794038772583, 351.9260559082031, 0.0],
+                    [
+                        199.61117553710938,
+                        26.338354110717773,
+                        1.9260603189468384,
+                        8.149533,
+                    ],
+                    [
+                        183.54466247558594,
+                        99.64359283447266,
+                        11.92605972290039,
+                        16.317757,
+                    ],
+                    [
+                        0.3888263702392578,
+                        73.6616439819336,
+                        21.92605972290039,
+                        24.476635,
+                    ],
+                ],
+            },
+        ],
+        [
+            10,
+            {
+                "bboxes": [
+                    [0, 0, 5, 5, 0],
+                    [195, 0, 200, 5, 0],
+                    [195, 95, 200, 100, 0],
+                    [0, 95, 5, 99, 0],
+                ],
+                "keypoints": [
+                    [0, 0, 0, 0],
+                    [199, 0, 10, 8.72],
+                    [199, 99, 20, 17.46],
+                    [0, 99, 30, 26.19],
+                ],
+            },
+            {
+                "bboxes": [
+                    [0.0, 25.38059425354004, 5.260837078094482, 29.73569107055664, 0.0],
+                    [
+                        179.32180786132812,
+                        0.0,
+                        184.7351531982422,
+                        4.275995254516602,
+                        0.0,
+                    ],
+                    [
+                        194.73916625976562,
+                        70.2643051147461,
+                        200.0,
+                        74.6194076538086,
+                        0.0,
+                    ],
+                    [
+                        15.264852523803711,
+                        95.72400665283203,
+                        20.515911102294922,
+                        99.3386459350586,
+                        0.0,
+                    ],
+                ],
+                "keypoints": [
+                    [0.3888259530067444, 26.338354110717773, 8.073939323425293, 0.0],
+                    [
+                        183.54466247558594,
+                        0.35640716552734375,
+                        18.073938369750977,
+                        8.149533,
+                    ],
+                    [
+                        199.61117553710938,
+                        73.6616439819336,
+                        28.073936462402344,
+                        16.317757,
+                    ],
+                    [
+                        16.455339431762695,
+                        99.64359283447266,
+                        38.073936462402344,
+                        24.476635,
+                    ],
+                ],
+            },
+        ],
+    ],
+)
+def test_safe_rotate(angle: float, targets: dict, expected: dict):
+    image = np.empty([100, 200, 3], dtype=np.uint8)
+    t = A.Compose(
+        [
+            A.SafeRotate(angle_range=(angle, angle), border_mode=0, fill=0, p=1),
+        ],
+        bbox_params=A.BboxParams(coord_format="pascal_voc", min_visibility=0.0),
+        keypoint_params=A.KeypointParams("xyas", angle_in_degrees=True, remove_invisible=False),
+        p=1,
+        seed=137,
+        strict=True,
+    )
+    res = t(image=image, **targets)
+
+    for key, value in expected.items():
+        np.testing.assert_allclose(res[key], value, atol=1e-6, rtol=1e-6), key
+
+
+@pytest.mark.parametrize(
+    "aug_cls",
+    [
+        (lambda rotate: A.Affine(rotate=(rotate, rotate), p=1, border_mode=cv2.BORDER_CONSTANT, fill=0)),
+        (
+            lambda rotate: A.ShiftScaleRotate(
+                shift_range=(0, 0),
+                scale_range=(0, 0),
+                rotate_range=(rotate, rotate),
+                p=1,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=0,
+            )
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "img",
+    [
+        SQUARE_UINT8_IMAGE,
+        cv2.randu(np.zeros((25, 100, 3), dtype=np.uint8), 0, 255),
+        cv2.randu(np.zeros((100, 25, 3), dtype=np.uint8), 0, 255),
+    ],
+)
+# @pytest.mark.parametrize("angle", list(range(-360, 360, 15)))
+@pytest.mark.parametrize("angle", [15])
+def test_rotate_equal(img, aug_cls, angle):
+    height, width = img.shape[:2]
+    kp = [
+        [
+            random.randint(0, width - 1),
+            random.randint(0, height - 1),
+            random.randint(0, 360),
+        ]
+        for _ in range(50)
+    ]
+    kp += [
+        [round(width * 0.2), int(height * 0.3), 90],
+        [int(width * 0.2), int(height * 0.3), 90],
+        [int(width * 0.2), int(height * 0.3), 90],
+        [int(width * 0.2), int(height * 0.3), 90],
+        [0, 0, 0],
+        [width - 1, height - 1, 0],
+    ]
+    keypoint_params = A.KeypointParams("xya", remove_invisible=False)
+
+    a = A.Compose(
+        [aug_cls(rotate=angle)],
+        keypoint_params=keypoint_params,
+        seed=137,
+        strict=True,
+    )
+
+    b = A.Compose(
+        [A.Rotate((angle, angle), border_mode=cv2.BORDER_CONSTANT, fill=0, p=1)],
+        keypoint_params=keypoint_params,
+        seed=137,
+        strict=True,
+    )
+    res_a = a(image=img, keypoints=kp)
+    res_b = b(image=img, keypoints=kp)
+    np.testing.assert_array_equal(res_a["image"], res_b["image"])
+
+    res_a = np.array(res_a["keypoints"])
+    res_b = np.array(res_b["keypoints"])
+    diff = np.round(np.abs(res_a - res_b))
+    assert diff[:, :2].max() <= 2
+    assert (diff[:, -1] % 360).max() <= 1
+
+
+def test_motion_blur_allow_shifted():
+    # Use fixed parameters to ensure horizontal/vertical lines for center checking
+    transform = A.MotionBlur(
+        allow_shifted=False,
+        angle_range=(0, 0),  # Fixed horizontal angle
+        direction_range=(0, 0),  # Symmetric direction
+        blur_range=(7, 7),  # Fixed kernel size
+    )
+    kernel = transform.sample_parameters(
+        *make_sampling_args(transform, {}),
+        sampling=SamplingContext.from_owner(transform, {}),
+    ).params["kernel"]
+
+    center = kernel.shape[0] / 2 - 0.5
+
+    def check_center(vector):
+        start = None
+        end = None
+
+        for i, v in enumerate(vector):
+            if start is None and v != 0:
+                start = i
+            elif start is not None and v == 0:
+                end = i
+                break
+        if end is None:
+            end = len(vector)
+
+        assert (end + start - 1) / 2 == center
+
+    check_center(kernel.sum(axis=0))
+    check_center(kernel.sum(axis=1))
+
+
+def test_motion_blur_allow_shifted_true():
+    """Test that allow_shifted=True produces different kernels at transform level."""
+    transform = A.MotionBlur(
+        allow_shifted=True,
+        angle_range=(0, 0),  # Fixed horizontal angle
+        direction_range=(0, 0),  # Symmetric direction
+        blur_range=(7, 7),  # Fixed kernel size
+        p=1.0,
+    )
+
+    # Generate multiple kernels with same transform instance
+    kernels = []
+    for _ in range(10):
+        kernel = transform.sample_parameters(
+            *make_sampling_args(transform, {}),
+            sampling=SamplingContext.from_owner(transform, {}),
+        ).params["kernel"]
+        kernels.append(kernel)
+
+    # Check that not all kernels are identical (shifting should cause variation)
+    # We expect at least some kernels to be different due to random shifting
+    unique_kernels = set()
+    for kernel in kernels:
+        # Convert to tuple for hashability
+        kernel_tuple = tuple(kernel.flatten())
+        unique_kernels.add(kernel_tuple)
+
+    # With allow_shifted=True, we should get some variation in kernel positions
+    # Even if not all are different, we should have more than 1 unique kernel
+    assert len(unique_kernels) > 1, "allow_shifted=True should produce some variation in kernel positions"
+
+
+@pytest.mark.parametrize(
+    "augmentation",
+    [
+        A.RandomGravel(),
+        A.RandomSnow(),
+        A.RandomRain(),
+        A.Spatter(),
+        A.ChromaticAberration(),
+    ],
+)
+@pytest.mark.parametrize("img_channels", [1, 6])
+def test_non_rgb_transform_warning(augmentation, img_channels):
+    img = np.random.randint(0, 255, (100, 100, img_channels), dtype=np.uint8)
+
+    with pytest.raises(ValueError) as exc_info:
+        augmentation(image=img, force_apply=True)
+
+    message = "This transformation expects 3-channel images"
+    assert str(exc_info.value).startswith(message)
+
+
+@pytest.mark.parametrize("image", IMAGES)
+@pytest.mark.parametrize(
+    "grid",
+    [
+        (3, 3),
+        (4, 4),
+        (5, 7),
+    ],
+)
+def test_grid_shuffle(image, grid):
+    """As we reshuffle the grid, the mean and sum of the image and mask should remain the same,
+    while the reshuffled image and mask should not be equal to the original image and mask.
+    """
+    mask = image.copy()
+
+    aug = A.Compose([A.RandomGridShuffle(grid=grid, p=1)], seed=137, strict=True)
+
+    res = aug(image=image, mask=mask)
+    assert res["image"].shape == image.shape
+    assert res["mask"].shape == mask.shape
+
+    assert not np.array_equal(res["image"], image)
+    assert not np.array_equal(res["mask"], mask)
+
+    np.testing.assert_allclose(
+        res["image"].sum(axis=(0, 1)),
+        image.sum(axis=(0, 1)),
+        atol=0.04,
+    )
+    np.testing.assert_allclose(
+        res["mask"].sum(axis=(0, 1)),
+        mask.sum(axis=(0, 1)),
+        atol=0.03,
+    )
+
+
+@pytest.mark.parametrize("image", IMAGES)
+@pytest.mark.parametrize(
+    "crop_left, crop_right, crop_top, crop_bottom",
+    [
+        (0, 0, 0, 0),
+        (0, 1, 0, 1),
+        (1, 0, 1, 0),
+        (0.5, 0.5, 0.5, 0.5),
+        (0.1, 0.1, 0.1, 0.1),
+        (0.3, 0.3, 0.3, 0.3),
+    ],
+)
+def test_random_crop_from_borders(
+    image,
+    bboxes,
+    keypoints,
+    crop_left,
+    crop_right,
+    crop_top,
+    crop_bottom,
+):
+    aug = A.Compose(
+        [
+            A.RandomCropFromBorders(
+                crop_left=crop_left,
+                crop_right=crop_right,
+                crop_top=crop_top,
+                crop_bottom=crop_bottom,
+                p=1,
+            ),
+        ],
+        bbox_params=A.BboxParams("pascal_voc"),
+        keypoint_params=A.KeypointParams("xy"),
+        seed=137,
+        strict=True,
+    )
+
+    assert aug(image=image, mask=image, bboxes=bboxes, keypoints=keypoints)
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_2d_transform_params(
+        except_augmentations={
+            A.RandomCropNearBBox,
+            A.RandomSizedBBoxSafeCrop,
+            A.BBoxSafeRandomCrop,
+            A.CropNonEmptyMaskIfExists,
+            A.NoOp,
+            A.Lambda,
+            A.ToRGB,
+            A.Colorize,
+            A.FrequencyMasking,
+            A.TimeMasking,
+            A.RandomRotate90,
+            A.CopyAndPaste,
+            A.GuidedCoarseDropout,
+            A.BBoxSubsetSafeRandomCrop,
+        },
+    ),
+)
+def test_change_image(augmentation_cls, params, image):
+    """Checks whether resulting image is different from the original one."""
+    aug = A.Compose([augmentation_cls(p=1, **params)], seed=137, strict=False)
+
+    original_image = image.copy()
+
+    data = {
+        "image": image,
+    }
+
+    if augmentation_cls == A.OverlayElements:
+        data["overlay_metadata"] = {
+            "image": clip(SQUARE_UINT8_IMAGE + 2, image.dtype),
+            "bbox": (0.1, 0.12, 0.6, 0.3),
+        }
+    elif augmentation_cls == A.FromFloat:
+        data["image"] = SQUARE_FLOAT_IMAGE
+    elif augmentation_cls in {A.MaskDropout, A.ConstrainedCoarseDropout}:
+        mask = np.zeros_like(image)[:, :, 0]
+        mask[:20, :20] = 1
+        data["mask"] = mask
+    elif augmentation_cls == A.ConstrainedCoarseDropout:
+        data["mask"] = np.zeros_like(image)[:, :, 0]
+        data["mask"][:20, :20] = 1
+    elif augmentation_cls == A.Mosaic:
+        data["mosaic_metadata"] = [
+            {
+                "image": image,
+            },
+        ]
+    elif augmentation_cls == A.CopyAndPaste:
+        data["copy_paste_metadata"] = []
+    elif augmentation_cls in TransformTestHelper.METADATA_KEYS:
+        data[TransformTestHelper.METADATA_KEYS[augmentation_cls]] = [
+            np.random.randint(0, 255, image.shape, dtype=image.dtype),
+        ]
+
+    transformed = aug(**data)
+
+    np.testing.assert_array_equal(image, original_image)
+    assert not np.array_equal(transformed["image"], image)
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_2d_transform_params(
+        custom_arguments={
+            A.AdvancedBlur: {
+                "blur_range": (5, 7),
+                "sigma_x_range": (1, 3),
+                "sigma_y_range": (1, 3),
+                "rotate_range": (0, 0),
+            },
+        },
+        except_augmentations={
+            A.Crop,
+            A.CenterCrop,
+            A.CropNonEmptyMaskIfExists,
+            A.RandomCrop,
+            A.AtLeastOneBBoxRandomCrop,
+            A.RandomResizedCrop,
+            A.RandomSizedCrop,
+            A.CropAndPad,
+            A.Resize,
+            A.RandomCropNearBBox,
+            A.RandomSizedBBoxSafeCrop,
+            A.BBoxSafeRandomCrop,
+            A.CropNonEmptyMaskIfExists,
+            A.FDA,
+            A.HistogramMatching,
+            A.NoOp,
+            A.Lambda,
+            A.ToRGB,
+            A.Colorize,
+            A.ChannelDropout,
+            A.LongestMaxSize,
+            A.LetterBox,
+            A.PadIfNeeded,
+            A.RandomCropFromBorders,
+            A.SmallestMaxSize,
+            A.RandomScale,
+            A.ChannelShuffle,
+            A.ChromaticAberration,
+            A.PlanckianJitter,
+            A.OverlayElements,
+            A.FromFloat,
+            A.PixelDistributionAdaptation,
+            A.MaskDropout,
+            A.Pad,
+            A.ConstrainedCoarseDropout,
+            A.GuidedCoarseDropout,
+            A.RandomRotate90,
+            A.FrequencyMasking,
+            A.TimeMasking,
+            A.Mosaic,
+            A.CopyAndPaste,
+            A.BBoxSubsetSafeRandomCrop,
+        },
+    ),
+)
+def test_selective_channel(
+    augmentation_cls: BasicTransform,
+    params: dict[str, Any],
+) -> None:
+    image = SQUARE_MULTI_UINT8_IMAGE
+    channels = [3, 2, 4]
+
+    aug_cls = augmentation_cls(**params, p=1)
+
+    aug = A.Compose(
+        [
+            A.SelectiveChannelTransform(
+                transforms=[aug_cls],
+                channels=channels,
+                p=1,
+            ),
+        ],
+        seed=137,
+        strict=False,
+    )
+
+    transformed_image = aug(image=image)["image"]
+
+    for channel in range(image.shape[-1]):
+        if channel in channels:
+            assert not np.array_equal(
+                image[..., channel],
+                transformed_image[..., channel],
+            )
+        else:
+            np.testing.assert_array_equal(
+                image[..., channel],
+                transformed_image[..., channel],
+            )
+
+
+@pytest.mark.parametrize(
+    "params, expected",
+    [
+        # Default values
+        (
+            {},
+            {
+                "min_height": 1024,
+                "min_width": 1024,
+                "position": "center",
+                "border_mode": cv2.BORDER_CONSTANT,
+                "fill": 0,
+                "fill_mask": 0,
+            },
+        ),
+        # Boundary values
+        ({"min_height": 800, "min_width": 800}, {"min_height": 800, "min_width": 800}),
+        (
+            {
+                "pad_height_divisor": 10,
+                "min_height": None,
+                "pad_width_divisor": 10,
+                "min_width": None,
+            },
+            {
+                "pad_height_divisor": 10,
+                "min_height": None,
+                "pad_width_divisor": 10,
+                "min_width": None,
+            },
+        ),
+        ({"position": "top_left"}, {"position": "top_left"}),
+        # Value handling when border_mode is BORDER_CONSTANT
+        (
+            {"border_mode": cv2.BORDER_CONSTANT, "fill": 255},
+            {"border_mode": cv2.BORDER_CONSTANT, "fill": 255},
+        ),
+        (
+            {"border_mode": cv2.BORDER_CONSTANT, "fill": (0, 0, 0)},
+            {"border_mode": cv2.BORDER_CONSTANT, "fill": (0, 0, 0)},
+        ),
+        # Mask value handling
+        (
+            {"border_mode": cv2.BORDER_CONSTANT, "fill": (0, 0, 0), "fill_mask": 128},
+            {"border_mode": cv2.BORDER_CONSTANT, "fill": (0, 0, 0), "fill_mask": 128},
+        ),
+    ],
+)
+def test_pad_if_needed_functionality(params, expected):
+    aug = A.PadIfNeeded(**params, p=1)
+    # Get the initialization arguments to check against expected
+    aug_dict = {key: getattr(aug, key) for key in expected}
+
+    for key, value in expected.items():
+        assert aug_dict[key] == value, f"Failed on {key} with value {value}"
+
+
+@pytest.mark.parametrize(
+    "px",
+    [
+        10,
+        (10, 20),
+        (-10, 20, -30, 40),
+        ((10, 20), (20, 30), (30, 40), (40, 50)),
+        None,
+    ],
+)
+@pytest.mark.parametrize(
+    "percent",
+    [
+        0.1,
+        (0.1, 0.2),
+        (0.1, 0.2, 0.3, 0.4),
+        ((-0.1, -0.2), (-0.2, -0.3), (0.3, 0.4), (0.4, 0.5)),
+        None,
+    ],
+)
+@pytest.mark.parametrize(
+    "fill",
+    [
+        0,
+        (0, 255),
+        [0, 255],
+    ],
+)
+@pytest.mark.parametrize(
+    "keep_size",
+    [
+        True,
+        False,
+    ],
+)
+@pytest.mark.parametrize(
+    "sample_independently",
+    [
+        True,
+        False,
+    ],
+)
+@pytest.mark.parametrize("image", IMAGES)
+def test_crop_and_pad(px, percent, fill, keep_size, sample_independently, image):
+    fill_mask = 255 if isinstance(fill, list) else fill
+
+    interpolation = cv2.INTER_LINEAR
+    border_mode = cv2.BORDER_CONSTANT
+    if (px is None) == (percent is None):
+        # Skip the test case where both px and percent are None or both are not None
+        return
+
+    transform = A.Compose(
+        [
+            A.CropAndPad(
+                px=px,
+                percent=percent,
+                border_mode=border_mode,
+                fill=fill,
+                fill_mask=fill_mask,
+                keep_size=keep_size,
+                sample_independently=sample_independently,
+                interpolation=interpolation,
+                p=1,
+            ),
+        ],
+        strict=True,
+        seed=137,
+    )
+
+    transformed_image = transform(image=image)["image"]
+
+    if keep_size:
+        assert transformed_image.shape == image.shape
+
+    assert transformed_image is not None
+    assert transformed_image.shape[0] > 0
+    assert transformed_image.shape[1] > 0
+    assert transformed_image.shape[2] == image.shape[2]
+
+
+@pytest.mark.parametrize(
+    "percent, expected_shape",
+    [
+        (0.1, (12, 12, 3)),  # Padding 10% of image size on each side
+        (-0.1, (8, 8, 3)),  # Cropping 10% of image size from each side
+        (
+            (0.1, 0.2, 0.3, 0.4),
+            (14, 16, 3),
+        ),  # Padding: top=10%, right=20%, bottom=30%, left=40%
+        (
+            (-0.1, -0.2, -0.3, -0.4),
+            (6, 4, 3),
+        ),  # Cropping: top=10%, right=20%, bottom=30%, left=40%
+    ],
+)
+def test_crop_and_pad_percent(percent, expected_shape):
+    transform = A.Compose(
+        [
+            A.CropAndPad(
+                px=None,
+                percent=percent,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=0,
+                keep_size=False,
+            ),
+        ],
+        strict=True,
+        seed=137,
+    )
+
+    image = np.ones((10, 10, 3), dtype=np.uint8)
+
+    transformed_image = transform(image=image)["image"]
+
+    assert transformed_image.shape == expected_shape
+    if percent is not None and all(p >= 0 for p in np.array(percent).flatten()):
+        assert transformed_image.sum() == image.sum()
+
+
+@pytest.mark.parametrize(
+    "px, expected_shape",
+    [
+        (2, (14, 14, 3)),  # Padding 2 pixels on each side
+        (-2, (6, 6, 3)),  # Cropping 2 pixels from each side
+        ((1, 2, 3, 4), (14, 16, 3)),  # Padding: top=1, right=2, bottom=3, left=4
+        ((-1, -2, -3, -4), (6, 4, 3)),  # Cropping: top=1, right=2, bottom=3, left=4
+    ],
+)
+def test_crop_and_pad_px_pixel_values(px, expected_shape):
+    transform = A.Compose(
+        [
+            A.CropAndPad(
+                px=px,
+                percent=None,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=0,
+                keep_size=False,
+            ),
+        ],
+        strict=True,
+        seed=137,
+    )
+
+    image = np.ones((10, 10, 3), dtype=np.uint8) * 255
+
+    transformed_image = transform(image=image)["image"]
+    assert transformed_image.shape == expected_shape
+
+    if isinstance(px, int):
+        px = [px] * 4
+    if isinstance(px, tuple) and len(px) == 2:
+        px = [px[0], px[1], px[0], px[1]]
+
+    if px is not None:
+        if all(p >= 0 for p in px):  # Padding
+            pad_top, _pad_right, _pad_bottom, pad_left = px
+            central_region = transformed_image[
+                pad_top : pad_top + image.shape[0],
+                pad_left : pad_left + image.shape[1],
+                :,
+            ]
+            np.testing.assert_array_equal(central_region, 255)
+        elif all(p <= 0 for p in px):  # Cropping
+            crop_top, crop_right, crop_bottom, crop_left = (-p for p in px)
+            cropped_region = image[
+                crop_top : image.shape[0] - crop_bottom,
+                crop_left : image.shape[1] - crop_right,
+                :,
+            ]
+            np.testing.assert_array_equal(transformed_image, cropped_region)
+
+
+@pytest.mark.parametrize(
+    ("choices_key", "choices", "realized_key"),
+    [
+        pytest.param("px_choices", (-8, -4), "px", id="pixels"),
+        pytest.param("percent_choices", (-0.16, -0.08), "percent", id="percent"),
+    ],
+)
+@pytest.mark.parametrize("sample_independently", [False, True])
+def test_crop_and_pad_choice_sources_emit_replayable_realizations(
+    choices_key: str,
+    choices: tuple[int, ...] | tuple[float, ...],
+    realized_key: str,
+    sample_independently: bool,
+) -> None:
+    image = np.arange(50 * 50 * 3, dtype=np.uint8).reshape(50, 50, 3)
+    transform = A.Compose(
+        [
+            A.CropAndPad(
+                **{choices_key: choices},
+                keep_size=False,
+                sample_independently=sample_independently,
+                p=1.0,
+            ),
+        ],
+        save_applied_params=True,
+        seed=137,
+    )
+
+    result = transform(image=image)
+    applied_config = transform.transforms[0].applied_config
+
+    assert applied_config[choices_key] is None
+    assert all(value in choices for value in applied_config[realized_key])
+    if not sample_independently:
+        assert len(set(applied_config[realized_key])) == 1
+
+    replay = A.Compose.from_applied_transforms(result["applied_transforms"])
+    np.testing.assert_array_equal(replay(image=image)["image"], result["image"])
+
+
+@pytest.mark.parametrize("target", ["image", "images", "volume", "volumes"])
+@pytest.mark.parametrize("container", ["numpy", "tensor"])
+@pytest.mark.parametrize("channels", [1, 3])
+@pytest.mark.parametrize("dtype", [np.uint8, np.float16, np.float32])
+def test_downscale_compose_preserves_dtype_and_channels(target, container, channels, dtype):
+    shapes = {
+        "image": (17, 13, channels),
+        "images": (2, 17, 13, channels),
+        "volume": (3, 17, 13, channels),
+        "volumes": (2, 3, 17, 13, channels),
+    }
+    rng = np.random.default_rng(137)
+    if dtype is np.uint8:
+        image = rng.integers(0, 256, shapes[target], dtype=np.uint8)
+    else:
+        half_image = rng.random(shapes[target], dtype=np.float32).astype(np.float16)
+        image = half_image if dtype is np.float16 else half_image.astype(np.float32)
+    original = image.copy()
+
+    def make_source(value):
+        source = value.copy()
+        if container == "tensor":
+            return numpy_to_tensor_spatial(source, target)
+        source.flags.writeable = False
+        return source
+
+    def run(value):
+        source = make_source(value)
+        pipeline = A.Compose(
+            [
+                A.Downscale(
+                    scale_range=(0.5, 0.5),
+                    interpolation_pair={"downscale": cv2.INTER_NEAREST, "upscale": cv2.INTER_NEAREST},
+                    p=1.0,
+                ),
+            ],
+            seed=137,
+            strict=True,
+        )
+        return pipeline(**{target: source})[target], source
+
+    result, source = run(image)
+    actual = tensor_to_numpy_spatial(result, target) if container == "tensor" else result
+    preserved = tensor_to_numpy_spatial(source, target) if container == "tensor" else source
+
+    assert type(result) is type(source)
+    assert actual.shape == image.shape
+    assert actual.dtype == dtype
+    np.testing.assert_array_equal(preserved, original)
+    if dtype is np.float16:
+        float32_result, _ = run(image.astype(np.float32))
+        expected = tensor_to_numpy_spatial(float32_result, target) if container == "tensor" else float32_result
+        np.testing.assert_array_equal(actual, expected.astype(np.float16))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"px_choices": (-5,)}, id="pixel"),
+        pytest.param({"percent_choices": (-0.1,)}, id="percent"),
+    ],
+)
+def test_crop_and_pad_choice_sources_match_fixed_crop(kwargs: dict[str, tuple[int, ...] | tuple[float, ...]]) -> None:
+    image = np.arange(50 * 50 * 3, dtype=np.uint8).reshape(50, 50, 3)
+    transformed = A.CropAndPad(**kwargs, keep_size=False, p=1.0)(image=image)["image"]
+
+    np.testing.assert_array_equal(transformed, image[5:-5, 5:-5])
+
+
+@pytest.mark.parametrize(
+    ("dtype", "fill"),
+    [(np.uint8, 137), (np.float16, 0.375), (np.float32, 0.375)],
+)
+@pytest.mark.parametrize("keep_size", [False, True])
+def test_crop_and_pad_compose_preserves_singleton_channel(dtype, fill, keep_size):
+    image = np.full((17, 13, 1), fill, dtype=dtype)
+    original = image.copy()
+    transform = A.Compose([A.CropAndPad(px=1, keep_size=keep_size, fill=fill, p=1.0)], seed=137)
+
+    result = transform(image=image)["image"]
+
+    expected_shape = image.shape if keep_size else (19, 15, 1)
+    assert result.shape == expected_shape
+    assert result.dtype == image.dtype
+    np.testing.assert_array_equal(result, np.full(expected_shape, fill, dtype=dtype))
+    np.testing.assert_array_equal(image, original)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        pytest.param({}, "Exactly one", id="missing-source"),
+        pytest.param({"px": 4, "px_choices": (2, 4)}, "Exactly one", id="multiple-sources"),
+        pytest.param({"px_choices": ()}, "must not be empty", id="empty-pixel-choices"),
+        pytest.param({"percent_choices": ()}, "must not be empty", id="empty-percent-choices"),
+        pytest.param({"percent_choices": (-1.1,)}, "must be in", id="percent-below-range"),
+        pytest.param({"percent_choices": (1.1,)}, "must be in", id="percent-above-range"),
+    ],
+)
+def test_crop_and_pad_choice_sources_validate_configuration(kwargs: dict[str, Any], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        A.CropAndPad(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        ({"fog_coef_range": (1.2, 1.5)}),  # Invalid fog coefficient range -> upper bound
+        ({"fog_coef_range": (0.9, 0.7)}),  # Invalid range  -> decreasing
+    ],
+)
+def test_random_fog_invalid_input(params):
+    with pytest.raises(ValueError, match=r"validation error"):
+        A.RandomFog(**params)
+
+
+@pytest.mark.parametrize("image", [*IMAGES, np.full((100, 100), 128, dtype=np.uint8)])
+@pytest.mark.parametrize("mean", (0, 0.1, -0.1))
+def test_gauss_noise(mean, image):
+    aug = A.GaussNoise(p=1, mean_range=(mean, mean))
+    aug.set_random_seed(42)
+
+    sampled_params = aug.sample_parameters(
+        *make_sampling_args(aug, {"image": image}),
+        sampling=SamplingContext.from_owner(aug, {}),
+    )
+    apply_params = sampled_params.params_for("image")
+
+    assert (
+        np.abs(
+            mean - apply_params["noise_map"].mean() / MAX_VALUES_BY_DTYPE[image.dtype],
+        )
+        < 0.5
+    )
+    result = A.Compose([aug], seed=137, strict=True)(image=image)
+
+    assert not (result["image"] >= image).all()
+
+
+@pytest.mark.parametrize(
+    ("noise_type", "noise_params"),
+    [
+        ("uniform", {"ranges": [(-0.2, 0.2)]}),
+        ("gaussian", {"mean_range": (0.0, 0.0), "std_range": (0.1, 0.1)}),
+        ("laplace", {"mean_range": (0.0, 0.0), "scale_range": (0.1, 0.1)}),
+        ("beta", {"alpha_range": (0.5, 1.5), "beta_range": (0.5, 1.5), "scale_range": (0.1, 0.3)}),
+    ],
+)
+@pytest.mark.parametrize("spatial_mode", ["per_pixel", "shared", "patch"])
+def test_additive_noise_spatial_map_is_float32(noise_type, noise_params, spatial_mode):
+    image = np.full((32, 48, 3), 128, dtype=np.uint8)
+    aug = A.AdditiveNoise(
+        noise_type=noise_type,
+        spatial_mode=spatial_mode,
+        noise_params=noise_params,
+        p=1,
+    )
+
+    apply_params = aug.sample_parameters(
+        *make_sampling_args(aug, {"image": image}),
+        sampling=SamplingContext.from_owner(aug, {}),
+    ).params_for("image")
+
+    np.testing.assert_equal(apply_params["noise_map"].dtype, np.float32)
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float16, np.float32])
+@pytest.mark.parametrize("container", ["numpy", "tensor"])
+@pytest.mark.parametrize(
+    ("fill", "noise_range", "expected"),
+    [(0, (-0.5, -0.5), 0), (1, (0.5, 0.5), 1)],
+)
+def test_additive_noise_compose_clips_in_its_owner(dtype, container, fill, noise_range, expected):
+    max_value = 255 if dtype == np.uint8 else 1
+    image = np.full((9, 11, 3), fill * max_value, dtype=dtype)
+    original = image.copy()
+    source = numpy_to_tensor_spatial(image.copy(), "image") if container == "tensor" else image.copy()
+    if container == "numpy":
+        source.flags.writeable = False
+
+    transform = A.Compose(
+        [
+            A.AdditiveNoise(
+                noise_type="uniform",
+                spatial_mode="shared",
+                noise_params={"ranges": [noise_range]},
+                p=1.0,
+            ),
+        ],
+        seed=137,
+        strict=True,
+    )
+    result = transform(image=source)["image"]
+    actual = tensor_to_numpy_spatial(result, "image") if container == "tensor" else result
+    preserved = tensor_to_numpy_spatial(source, "image") if container == "tensor" else source
+
+    assert actual.dtype == dtype
+    assert actual.shape == image.shape
+    np.testing.assert_array_equal(actual, np.full(image.shape, expected * max_value, dtype=dtype))
+    np.testing.assert_array_equal(preserved, original)
+
+
+def test_additive_noise_patch_changes_only_sampled_rectangle() -> None:
+    image = np.full((20, 30, 3), 128, dtype=np.uint8)
+    transform = A.ReplayCompose(
+        [
+            A.AdditiveNoise(
+                noise_type="uniform",
+                spatial_mode="patch",
+                noise_params={"ranges": [(0.25, 0.25)]},
+                patch_count_range=(1, 1),
+                patch_height_range=(0.25, 0.25),
+                patch_width_range=(0.5, 0.5),
+                p=1.0,
+            ),
+        ],
+        seed=137,
+    )
+
+    result = transform(image=image)
+    patch = result["replay"]["transforms"][0]["params"]["target_params"][0]["params"]["patches"][0]
+    x_min, y_min, x_max, y_max = patch
+    expected_changed = np.zeros(image.shape[:2], dtype=bool)
+    expected_changed[y_min:y_max, x_min:x_max] = True
+    actual_changed = np.any(result["image"] != image, axis=-1)
+
+    np.testing.assert_array_equal(actual_changed, expected_changed)
+    np.testing.assert_array_equal((y_max - y_min, x_max - x_min), (5, 15))
+
+
+@pytest.mark.parametrize("per_channel", [False, True])
+def test_additive_noise_patch_channel_sampling(per_channel: bool) -> None:
+    image = np.full((16, 20, 5), 0.5, dtype=np.float32)
+    transform = A.Compose(
+        [
+            A.AdditiveNoise(
+                noise_type="gaussian",
+                spatial_mode="patch",
+                noise_params={"mean_range": (0.0, 0.0), "std_range": (0.1, 0.1)},
+                patch_height_range=(1.0, 1.0),
+                patch_width_range=(1.0, 1.0),
+                per_channel=per_channel,
+                p=1.0,
+            ),
+        ],
+        seed=137,
+    )
+
+    result = transform(image=image)["image"]
+    channel_noise_is_shared = np.all((result - image) == (result - image)[..., :1])
+
+    np.testing.assert_equal(channel_noise_is_shared, not per_channel)
+
+
+@pytest.mark.parametrize(
+    ("spatial_mode", "per_channel"),
+    [("constant", False), ("per_pixel", False), ("patch", True)],
+)
+def test_additive_noise_uniform_channel_ranges(spatial_mode: str, per_channel: bool) -> None:
+    image = np.zeros((8, 8, 3), dtype=np.float32)
+    patch_options = (
+        {
+            "patch_height_range": (1.0, 1.0),
+            "patch_width_range": (1.0, 1.0),
+            "per_channel": per_channel,
+        }
+        if spatial_mode == "patch"
+        else {}
+    )
+    transform = A.AdditiveNoise(
+        noise_type="uniform",
+        spatial_mode=spatial_mode,
+        noise_params={"ranges": [(0.1, 0.1), (0.2, 0.2), (0.3, 0.3)]},
+        p=1.0,
+        **patch_options,
+    )
+
+    result = transform(image=image)["image"]
+
+    expected = np.broadcast_to(np.array([0.1, 0.2, 0.3], dtype=np.float32), image.shape)
+    np.testing.assert_allclose(result, expected)
+
+
+def test_sample_uniform_resolved_channel_ranges_preserves_seeded_values() -> None:
+    size = (6, 8, 3)
+    ranges = [(-0.2, -0.1), (0.0, 0.1), (0.2, 0.3)]
+    lows, highs = np.asarray(ranges, dtype=np.float32).T
+    expected = np.random.default_rng(137).uniform(lows, highs, size=size)
+
+    actual = fnoise.sample_uniform(size, {"ranges": ranges}, np.random.default_rng(137))
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-15, atol=1e-15)
+
+
+@pytest.mark.parametrize(
+    ("spatial_mode", "per_channel"),
+    [("constant", False), ("per_pixel", False), ("patch", True)],
+)
+def test_additive_noise_uniform_rejects_too_few_channel_ranges_before_sampling(
+    spatial_mode: str,
+    per_channel: bool,
+) -> None:
+    image = np.zeros((8, 8, 3), dtype=np.float32)
+    patch_options = (
+        {
+            "patch_height_range": (1.0, 1.0),
+            "patch_width_range": (1.0, 1.0),
+            "per_channel": per_channel,
+        }
+        if spatial_mode == "patch"
+        else {}
+    )
+    transform = A.AdditiveNoise(
+        noise_type="uniform",
+        spatial_mode=spatial_mode,
+        noise_params={"ranges": [(0.1, 0.1), (0.2, 0.2)]},
+        p=1.0,
+        **patch_options,
+    )
+    sampling = SamplingContext.from_owner(transform, {})
+    py_random_state = sampling.py_random.getstate()
+    numpy_random_state = copy.deepcopy(sampling.random_generator.bit_generator.state)
+
+    with pytest.raises(ValueError, match="Not enough ranges provided"):
+        transform.sample_parameters(*make_sampling_args(transform, {"image": image}), sampling=sampling)
+
+    np.testing.assert_equal(sampling.py_random.getstate(), py_random_state)
+    np.testing.assert_equal(sampling.random_generator.bit_generator.state, numpy_random_state)
+
+
+@pytest.mark.parametrize(("spatial_mode", "per_channel"), [("shared", False), ("patch", False)])
+def test_additive_noise_uniform_shared_modes_use_first_range(spatial_mode: str, per_channel: bool) -> None:
+    image = np.zeros((8, 8, 3), dtype=np.float32)
+    patch_options = (
+        {"patch_height_range": (1.0, 1.0), "patch_width_range": (1.0, 1.0), "per_channel": per_channel}
+        if spatial_mode == "patch"
+        else {}
+    )
+    transform = A.AdditiveNoise(
+        noise_type="uniform",
+        spatial_mode=spatial_mode,
+        noise_params={"ranges": [(0.1, 0.1), (0.2, 0.2)]},
+        p=1.0,
+        **patch_options,
+    )
+
+    np.testing.assert_allclose(transform(image=image)["image"], 0.1)
+
+
+def test_additive_noise_patch_handles_single_pixel_grayscale() -> None:
+    image = np.zeros((1, 1), dtype=np.uint8)
+    transform = A.ReplayCompose(
+        [
+            A.AdditiveNoise(
+                noise_type="uniform",
+                spatial_mode="patch",
+                noise_params={"ranges": [(0.25, 0.25)]},
+                patch_height_range=(0.01, 0.01),
+                patch_width_range=(0.01, 0.01),
+                p=1.0,
+            ),
+        ],
+        seed=137,
+    )
+
+    result = transform(image=image)
+
+    np.testing.assert_array_equal(
+        result["replay"]["transforms"][0]["params"]["target_params"][0]["params"]["patches"],
+        [[0, 0, 1, 1]],
+    )
+    np.testing.assert_equal(result["image"].shape, image.shape)
+    np.testing.assert_array_less(image, result["image"])
+
+
+@pytest.mark.parametrize(
+    ("noise_type", "noise_params"),
+    [
+        ("uniform", {"ranges": [(-0.2, 0.2)]}),
+        ("gaussian", {"mean_range": (0.0, 0.0), "std_range": (0.1, 0.1)}),
+        ("laplace", {"mean_range": (0.0, 0.0), "scale_range": (0.1, 0.1)}),
+        ("beta", {"alpha_range": (0.5, 1.5), "beta_range": (0.5, 1.5), "scale_range": (0.1, 0.3)}),
+    ],
+)
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+@pytest.mark.parametrize("num_channels", [1, 3, 5])
+def test_additive_noise_patch_distributions_preserve_outside_pixels(
+    noise_type: str,
+    noise_params: dict[str, Any],
+    dtype: np.dtype,
+    num_channels: int,
+) -> None:
+    fill = 128 if dtype == np.uint8 else 0.5
+    image = np.full((12, 14, num_channels), fill, dtype=dtype)
+    transform = A.ReplayCompose(
+        [
+            A.AdditiveNoise(
+                noise_type=noise_type,
+                spatial_mode="patch",
+                noise_params=noise_params,
+                patch_count_range=(2, 2),
+                patch_height_range=(0.25, 0.5),
+                patch_width_range=(0.25, 0.5),
+                per_channel=num_channels > 1,
+                p=1.0,
+            ),
+        ],
+        seed=137,
+    )
+
+    result = transform(image=image)
+    patches = result["replay"]["transforms"][0]["params"]["target_params"][0]["params"]["patches"]
+    patch_mask = np.zeros(image.shape[:2], dtype=bool)
+    for x_min, y_min, x_max, y_max in patches:
+        patch_mask[y_min:y_max, x_min:x_max] = True
+
+    np.testing.assert_equal(result["image"].dtype, dtype)
+    np.testing.assert_array_equal(result["image"].shape, image.shape)
+    np.testing.assert_array_equal(result["image"][~patch_mask], image[~patch_mask])
+
+
+def test_additive_noise_patch_replay_and_batch_semantics() -> None:
+    image = np.full((18, 24, 3), 128, dtype=np.uint8)
+    images = np.stack([image, image])
+    transform = A.ReplayCompose(
+        [
+            A.AdditiveNoise(
+                noise_type="gaussian",
+                spatial_mode="patch",
+                patch_count_range=(2, 3),
+                patch_height_range=(0.2, 0.4),
+                patch_width_range=(0.2, 0.4),
+                per_channel=True,
+                p=1.0,
+            ),
+        ],
+        seed=137,
+    )
+
+    result = transform(images=images)
+    replayed = A.ReplayCompose.replay(result["replay"], images=images)
+
+    np.testing.assert_array_equal(result["images"][0], result["images"][1])
+    np.testing.assert_array_equal(result["images"], replayed["images"])
+    np.testing.assert_array_equal(images, np.stack([image, image]))
+
+
+def test_additive_noise_patch_seeded_serialization() -> None:
+    transform = A.AdditiveNoise(
+        noise_type="laplace",
+        spatial_mode="patch",
+        noise_params={"mean_range": (0.0, 0.0), "scale_range": (0.1, 0.1)},
+        patch_count_range=(2, 3),
+        patch_height_range=(0.2, 0.4),
+        patch_width_range=(0.3, 0.5),
+        per_channel=True,
+        p=1.0,
+    )
+    restored = A.from_dict(A.to_dict(transform))
+    image = np.full((18, 24, 5), 0.5, dtype=np.float32)
+    transform.set_random_seed(137)
+    restored.set_random_seed(137)
+
+    np.testing.assert_array_equal(transform(image=image)["image"], restored(image=image)["image"])
+
+
+def test_generate_patch_noise_overlapping_border_patches(monkeypatch: pytest.MonkeyPatch) -> None:
+    patches = np.array([[0, 0, 4, 4], [2, 2, 6, 6]], dtype=np.int32)
+    sampled_value = iter((1.0, 2.0))
+
+    def sample_constant_noise(
+        noise_type: str,
+        size: tuple[int, ...],
+        params: dict[str, Any],
+        max_value: float,
+        random_generator: np.random.Generator,
+    ) -> np.ndarray:
+        del noise_type, params, max_value, random_generator
+        return np.full(size, next(sampled_value), dtype=np.float32)
+
+    monkeypatch.setattr(fnoise, "sample_noise", sample_constant_noise)
+    result = fnoise.generate_patch_noise(
+        noise_type="gaussian",
+        shape=(6, 6, 1),
+        params={"mean_range": (0.0, 0.0), "std_range": (0.1, 0.1)},
+        max_value=1.0,
+        random_generator=np.random.default_rng(137),
+        patches=patches,
+        per_channel=False,
+    )
+    expected = np.zeros((6, 6, 1), dtype=np.float32)
+    expected[0:4, 0:4] = 1.0
+    expected[2:6, 2:6] = 2.0
+
+    np.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+@pytest.mark.parametrize("shape", [(6, 6), (6, 6, 3), (2, 6, 6, 3)])
+def test_add_noise_by_patches_matches_dense_application_for_overlaps(dtype: np.dtype, shape: tuple[int, ...]) -> None:
+    fill = 128 if dtype == np.uint8 else 0.5
+    image = np.full(shape, fill, dtype=dtype)
+    noise = np.zeros((6, 6, 1 if len(shape) == 2 else shape[-1]), dtype=np.float32)
+    patches = np.array([[0, 0, 4, 4], [2, 2, 6, 6]], dtype=np.int32)
+    noise[0:4, 0:4] = 0.1 * MAX_VALUES_BY_DTYPE[dtype]
+    noise[2:6, 2:6] = -0.2 * MAX_VALUES_BY_DTYPE[dtype]
+    expected_noise = noise[..., 0] if len(shape) == 2 else noise
+
+    expected = fnoise.add_noise(image, expected_noise)
+    result = fnoise.add_noise_by_patches(image, noise, patches)
+
+    np.testing.assert_array_equal(result, expected)
+    np.testing.assert_array_equal(image, np.full(shape, fill, dtype=dtype))
+
+
+@pytest.mark.parametrize(
+    "invalid_params",
+    [
+        {"patch_count_range": (0, 1)},
+        {"patch_count_range": (2, 1)},
+        {"patch_height_range": (0.0, 0.5)},
+        {"patch_height_range": (0.6, 0.5)},
+        {"patch_width_range": (0.5, 1.1)},
+        {"patch_width_range": (0.6, 0.5)},
+    ],
+)
+def test_additive_noise_patch_rejects_invalid_ranges(invalid_params: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="validation error"):
+        A.AdditiveNoise(spatial_mode="patch", **invalid_params)
+
+
+def test_additive_noise_rejects_patch_options_for_other_modes() -> None:
+    with pytest.raises(ValueError, match="Patch options can only be used"):
+        A.AdditiveNoise(spatial_mode="shared", patch_count_range=(2, 2))
+
+
+def test_add_noise_materializes_broadcast_uint8_noise(monkeypatch):
+    image = np.full((4, 6, 3), 128, dtype=np.uint8)
+    noise = np.ones((4, 6, 1), dtype=np.float32)
+    captured_noise: list[np.ndarray] = []
+
+    def capture_add(image: np.ndarray, noise: np.ndarray) -> np.ndarray:
+        captured_noise.append(noise)
+        return image
+
+    monkeypatch.setattr(fnoise, "add", capture_add)
+    fnoise.add_noise(image, noise)
+
+    assert len(captured_noise) == 1
+    assert captured_noise[0].shape == image.shape
+    assert captured_noise[0].flags.c_contiguous
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        ({"flare_roi": (1.2, 0.2, 0.8, 0.9)}),  # Invalid flare_roi -> x_min out of bounds
+        ({"flare_roi": (0.2, -0.1, 0.8, 0.9)}),  # Invalid flare_roi -> y_min out of bounds
+        ({"flare_roi": (0.2, 0.3, 1.2, 0.9)}),  # Invalid flare_roi -> x_max out of bounds
+        ({"flare_roi": (0.2, 0.3, 0.8, 1.1)}),  # Invalid flare_roi -> y_max out of bounds
+        ({"flare_roi": (0.8, 0.2, 0.4, 0.9)}),  # Invalid flare_roi -> x_min > x_max
+        ({"flare_roi": (0.2, 0.9, 0.8, 0.3)}),  # Invalid flare_roi -> y_min > y_max
+        ({"angle_range": (1.2, 0.5)}),  # Invalid angle range -> angle_upper out of bounds
+        ({"angle_range": (0.5, 1.2)}),  # Invalid angle range -> angle_upper out of bounds
+        ({"angle_range": (0.7, 0.5)}),  # Invalid angle range -> non-decreasing
+        ({"num_flare_circles_range": (12, 8)}),  # Invalid num_flare_circles_range -> non-decreasing
+        ({"num_flare_circles_range": (-1, 6)}),  # Invalid num_flare_circles_range -> lower bound negative
+    ],
+)
+def test_random_sun_flare_invalid_input(params):
+    with pytest.raises(ValueError):
+        A.RandomSunFlare(**params)
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_2d_transform_params(
+        except_augmentations={
+            A.RandomCropNearBBox,
+            A.RandomSizedBBoxSafeCrop,
+            A.BBoxSafeRandomCrop,
+            A.CropNonEmptyMaskIfExists,
+            A.OverlayElements,
+            A.NoOp,
+            A.Lambda,
+            A.GuidedCoarseDropout,
+            A.BBoxSubsetSafeRandomCrop,
+        },
+    ),
+)
+def test_return_nonzero(augmentation_cls, params):
+    """Mistakes in clipping may lead to zero image, testing for that"""
+    image = SQUARE_FLOAT_IMAGE if augmentation_cls == A.FromFloat else SQUARE_UINT8_IMAGE
+
+    aug = A.Compose([augmentation_cls(**params, p=1)], seed=137, strict=False)
+
+    data = {
+        "image": image,
+    }
+    if augmentation_cls == A.OverlayElements:
+        data["overlay_metadata"] = []
+    elif augmentation_cls == A.ToRGB:
+        data["image"] = cv2.randu(np.zeros((100, 100), dtype=np.uint8), 0, 255)
+    elif augmentation_cls == A.MaskDropout:
+        mask = np.zeros_like(image)[:, :, 0]
+        mask[:20, :20] = 1
+        data["mask"] = mask
+    elif augmentation_cls == A.Mosaic:
+        data["mosaic_metadata"] = [
+            {
+                "image": image,
+            },
+        ]
+    elif augmentation_cls == A.CopyAndPaste:
+        data["copy_paste_metadata"] = []
+    elif augmentation_cls in TransformTestHelper.METADATA_KEYS:
+        data[TransformTestHelper.METADATA_KEYS[augmentation_cls]] = [image]
+
+    result = aug(**data)
+
+    assert np.max(result["image"]) > 0
+
+
+@pytest.mark.parametrize(
+    "transform",
+    [
+        A.PadIfNeeded(
+            min_height=6,
+            min_width=6,
+            fill=128,
+            border_mode=cv2.BORDER_CONSTANT,
+            p=1,
+        ),
+        A.CropAndPad(
+            px=2,
+            border_mode=cv2.BORDER_CONSTANT,
+            fill=128,
+            p=1,
+            interpolation=cv2.INTER_NEAREST_EXACT,
+        ),
+        A.CropAndPad(
+            percent=(0, 0.3, 0, 0),
+            fill=128,
+            p=1,
+            interpolation=cv2.INTER_NEAREST_EXACT,
+        ),
+        A.Affine(
+            translate_px={"x": (-1, -1), "y": (-1, -1)},
+            fill=128,
+            p=1,
+            interpolation=cv2.INTER_NEAREST,
+        ),
+        A.Rotate(
+            p=1,
+            angle_range=(45, 45),
+            interpolation=cv2.INTER_NEAREST,
+            border_mode=cv2.BORDER_CONSTANT,
+            fill=128,
+        ),
+    ],
+)
+@pytest.mark.parametrize("num_channels", [1, 3, 5])
+def test_padding_color(transform, num_channels):
+    if num_channels == 1:
+        image = np.zeros((4, 4), dtype=np.uint8)
+    else:
+        image = np.zeros((4, 4, num_channels), dtype=np.uint8)
+
+    pipeline = A.Compose([transform], seed=137, strict=True)
+
+    augmented = pipeline(image=image)["image"]
+
+    # Check the unique values in each channel of the padded image
+    if num_channels == 1:
+        channels = [augmented]
+    else:
+        channels = [augmented[:, :, i] for i in range(num_channels)]
+
+    for channel_id, channel in enumerate(channels):
+        unique_values = np.unique(channel)
+        assert set(unique_values) == {0, 128}, f"{channel_id}"
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_dual_transform_params(
+        custom_arguments={},
+        except_augmentations={
+            A.RandomCropNearBBox,
+            A.RandomSizedBBoxSafeCrop,
+            A.BBoxSafeRandomCrop,
+            A.OverlayElements,
+            A.GridElasticDeform,
+            A.CropNonEmptyMaskIfExists,
+            A.GuidedCoarseDropout,
+            A.BBoxSubsetSafeRandomCrop,
+        },
+    ),
+)
+def test_empty_bboxes_keypoints(augmentation_cls, params):
+    aug = A.Compose(
+        [augmentation_cls(p=1, **params)],
+        bbox_params=A.BboxParams(coord_format="pascal_voc", label_fields=["labels"]),
+        keypoint_params=A.KeypointParams(coord_format="xy"),
+        seed=137,
+        strict=False,
+    )
+    image = SQUARE_UINT8_IMAGE
+    data = {
+        "image": image,
+        "bboxes": np.array([], dtype=np.float32).reshape(0, 4),
+        "labels": [],
+        "keypoints": np.array([], dtype=np.float32).reshape(0, 2),
+    }
+
+    if augmentation_cls == A.OverlayElements:
+        data = {
+            "image": image,
+            "overlay_metadata": [],
+        }
+    elif augmentation_cls == A.MaskDropout:
+        mask = np.zeros_like(image)[:, :, 0]
+        mask[:20, :20] = 1
+        data["mask"] = mask
+    elif augmentation_cls == A.Mosaic:
+        data["mosaic_metadata"] = [
+            {
+                "image": image,
+            },
+        ]
+    elif augmentation_cls == A.CopyAndPaste:
+        data["copy_paste_metadata"] = []
+    data = aug(**data)
+
+    np.testing.assert_array_equal(data["bboxes"], np.array([], dtype=np.float32).reshape(0, 4))
+    np.testing.assert_array_equal(data["keypoints"], np.array([], dtype=np.float32).reshape(0, 2))
+
+
+@pytest.mark.parametrize(
+    "remove_invisible, expected_keypoints",
+    [
+        (True, np.array([], dtype=np.float32).reshape(0, 2)),
+        (False, np.array([[10, 10]])),
+    ],
+)
+def test_mask_dropout_bboxes(remove_invisible, expected_keypoints):
+    image = SQUARE_UINT8_IMAGE
+    mask = np.zeros_like(image)[:, :, 0]
+    mask[:20, :20] = 1
+    keypoints = np.array([[10, 10]])
+
+    transform = A.Compose(
+        [A.MaskDropout(p=1, max_objects_range=(1, 1), fill_mask=0, fill=1)],
+        keypoint_params=A.KeypointParams(
+            coord_format="xy",
+            remove_invisible=remove_invisible,
+        ),
+        seed=137,
+        strict=True,
+    )
+
+    transformed = transform(image=image, mask=mask, keypoints=keypoints)
+    np.testing.assert_array_equal(transformed["keypoints"], expected_keypoints)
+
+
+@pytest.mark.parametrize(
+    ["augmentation_cls", "params"],
+    get_primary_2d_transform_params(
+        custom_arguments={},
+        except_augmentations={
+            A.XYMasking,
+            A.RandomSizedBBoxSafeCrop,
+            A.RandomCropNearBBox,
+            A.BBoxSafeRandomCrop,
+            A.CropNonEmptyMaskIfExists,
+            A.FDA,
+            A.HistogramMatching,
+            A.OverlayElements,
+            A.MaskDropout,
+            A.VerticalFlip,
+            A.HorizontalFlip,
+            A.GridElasticDeform,
+            A.PixelDistributionAdaptation,
+            A.SafeRotate,
+            A.Rotate,
+            A.Affine,
+            A.ShiftScaleRotate,
+            A.D4,
+            A.RandomRotate90,
+            A.SquareSymmetry,
+            A.PiecewiseAffine,
+            A.Perspective,
+            A.RandomGridShuffle,
+            A.TimeReverse,
+            A.Erasing,
+            A.ConstrainedCoarseDropout,
+            A.PixelDropout,
+            A.CoarseDropout,
+            A.ElasticTransform,
+            A.GridDistortion,
+            A.OpticalDistortion,
+            A.PixelSpread,
+            A.ThinPlateSpline,
+            A.Mosaic,
+            A.CopyAndPaste,
+            A.FrequencyMasking,
+            A.GridMask,
+            A.BBoxSubsetSafeRandomCrop,
+        },
+    ),
+)
+def test_keypoints_bboxes_match(augmentation_cls, params):
+    """Checks whether transformations based on DualTransform dont has abstract methods."""
+    aug = augmentation_cls(p=1, **params)
+
+    image = RECTANGULAR_UINT8_IMAGE
+
+    x_min, y_min, x_max, y_max = 40, 30, 50, 60
+
+    bboxes = np.array([[x_min, y_min, x_max, y_max]])
+    keypoints = np.array([[x_min, y_min], [x_max, y_max]])
+
+    transform = A.Compose(
+        [aug],
+        bbox_params=A.BboxParams(coord_format="pascal_voc", label_fields=["labels"], min_area=0, min_visibility=0),
+        keypoint_params=A.KeypointParams(coord_format="xy", remove_invisible=False),
+        seed=137,
+        strict=False,
+    )
+
+    data = {"image": image, "bboxes": bboxes, "keypoints": keypoints, "labels": [1]}
+    if augmentation_cls is A.GuidedCoarseDropout:
+        data[aug.region_key] = np.ones(image.shape[:2], dtype=np.uint8)
+    transformed = transform(**data)
+
+    x_min_transformed, y_min_transformed, x_max_transformed, y_max_transformed = transformed["bboxes"][0]
+
+    np.testing.assert_allclose(
+        transformed["keypoints"][0],
+        [x_min_transformed, y_min_transformed],
+        atol=1,
+    )
+    np.testing.assert_allclose(
+        transformed["keypoints"][1],
+        [x_max_transformed, y_max_transformed],
+        atol=1.5,
+    )
+
+
+@pytest.mark.parametrize(
+    ["input_shape", "max_size", "max_size_hw", "expected_shape"],
+    [
+        # LongestMaxSize with max_size
+        ((80, 60, 3), 40, None, (40, 30, 3)),  # landscape
+        ((60, 80, 3), 40, None, (30, 40, 3)),  # portrait
+        ((80, 80, 3), 40, None, (40, 40, 3)),  # square
+        # LongestMaxSize with max_size_hw - both dimensions
+        ((80, 60, 3), None, (40, 30), (40, 30, 3)),  # exact fit
+        ((80, 60, 3), None, (30, 40), (30, 22, 3)),  # height constrains
+        ((60, 80, 3), None, (40, 30), (22, 30, 3)),  # width constrains
+        # LongestMaxSize with max_size_hw - single dimension
+        ((80, 60, 3), None, (40, None), (40, 30, 3)),  # height only
+        ((80, 60, 3), None, (None, 30), (40, 30, 3)),  # width only
+    ],
+)
+def test_longest_max_size(input_shape, max_size, max_size_hw, expected_shape):
+    image = np.zeros(input_shape, dtype=np.uint8)
+    aug = A.LongestMaxSize(max_size=max_size, max_size_hw=max_size_hw)
+    transformed = aug(image=image)["image"]
+    assert transformed.shape == expected_shape
+
+
+@pytest.mark.parametrize(
+    ["input_shape", "max_size", "max_size_hw", "expected_shape"],
+    [
+        # SmallestMaxSize with max_size
+        ((80, 60, 3), 40, None, (53, 40, 3)),  # landscape
+        ((60, 80, 3), 40, None, (40, 53, 3)),  # portrait
+        ((80, 80, 3), 40, None, (40, 40, 3)),  # square
+        # SmallestMaxSize with max_size_hw - both dimensions
+        ((80, 60, 3), None, (40, 30), (40, 30, 3)),  # height determines
+        ((60, 80, 3), None, (30, 40), (30, 40, 3)),  # width determines
+        ((80, 80, 3), None, (40, 40), (40, 40, 3)),  # square input
+        # SmallestMaxSize with max_size_hw - single dimension
+        ((80, 60, 3), None, (40, None), (40, 30, 3)),  # height only
+        ((80, 60, 3), None, (None, 30), (40, 30, 3)),  # width only
+    ],
+)
+def test_smallest_max_size(input_shape, max_size, max_size_hw, expected_shape):
+    image = np.zeros(input_shape, dtype=np.uint8)
+    aug = A.SmallestMaxSize(max_size=max_size, max_size_hw=max_size_hw)
+    transformed = aug(image=image)["image"]
+    assert transformed.shape == expected_shape
+
+
+@pytest.mark.parametrize("group_element", ["e", "r90", "r180", "r270", "v", "hvt", "h", "t"])
+def test_d4_tta_deterministic(group_element):
+    """D4 with group_element produces deterministic output for TTA."""
+    image = np.arange(100 * 100 * 3, dtype=np.uint8).reshape(100, 100, 3)
+    transform = A.D4(p=1.0, group_element=group_element)
+    results = [transform(image=image)["image"] for _ in range(3)]
+    np.testing.assert_array_equal(results[0], results[1])
+    np.testing.assert_array_equal(results[1], results[2])
+
+
+@pytest.mark.parametrize("group_element", ["e", "r90", "r180", "r270"])
+def test_random_rotate90_tta_deterministic(group_element):
+    """RandomRotate90 with group_element produces deterministic output for TTA."""
+    image = np.arange(100 * 100 * 3, dtype=np.uint8).reshape(100, 100, 3)
+    transform = A.RandomRotate90(p=1.0, group_element=group_element)
+    results = [transform(image=image)["image"] for _ in range(3)]
+    np.testing.assert_array_equal(results[0], results[1])
+    np.testing.assert_array_equal(results[1], results[2])
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        (
+            {"group_element": "r90", "group_elements": ("r90", "r270")},
+            "mutually exclusive",
+        ),
+        (
+            {"group_elements": ()},
+            "non-empty",
+        ),
+        (
+            {"group_elements": ("r90", "foo")},
+            "Input should be 'e', 'r90', 'r180' or 'r270'",
+        ),
+        (
+            {"group_elements": ("r90", "r90", "r180")},
+            "group_elements must not contain duplicate elements",
+        ),
+    ],
+)
+def test_random_rotate90_group_elements_validation(kwargs: dict, match: str) -> None:
+    """Invalid group_elements configurations raise a ValueError."""
+    with pytest.raises(ValueError, match=match):
+        A.RandomRotate90(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("transform", "expected_elements"),
+    [
+        (
+            A.RandomRotate90(p=1.0),
+            {"e", "r90", "r180", "r270"},
+        ),
+        (
+            A.RandomRotate90(p=1.0, group_elements=("r90", "r270")),
+            {"r90", "r270"},
+        ),
+    ],
+)
+def test_random_rotate90_records_sampled_group_element_in_applied_config(
+    transform: A.RandomRotate90,
+    expected_elements: set[str],
+) -> None:
+    """The sampled rotation element is recorded in the applied configuration."""
+    image = np.arange(64 * 64 * 3, dtype=np.uint8).reshape(64, 64, 3)
+    transform.set_random_seed(137)
+
+    result = transform(image=image)["image"]
+    applied_config = transform.get_applied_config()
+
+    assert applied_config["group_element"] in expected_elements
+    assert result.shape == image.shape
+
+
+def test_random_rotate90_group_elements_applied_config_round_trip() -> None:
+    """Recorded applied_config with group_elements must be replay-valid.
+
+    Regression: when group_elements is set, the recorded applied_config must not
+    contain both group_element and group_elements, which would cause
+    Compose.from_applied_transforms() to raise a ValueError.
+    """
+    image = np.zeros((16, 16, 3), dtype=np.uint8)
+    transform = A.Compose(
+        [A.RandomRotate90(p=1.0, group_elements=("r90", "r270"))],
+        save_applied_params=True,
+        strict=True,
+    )
+    result = transform(image=image)
+    # Must not raise ValueError about mutually exclusive group_element/group_elements
+    replay = A.Compose.from_applied_transforms(result["applied_transforms"])
+    replay_result = replay(image=image)
+    np.testing.assert_array_equal(result["image"], replay_result["image"])
+
+
+def test_random_rotate90_group_elements_serialization() -> None:
+    """Serializing and deserializing preserves group_elements behavior."""
+    image = np.arange(64 * 64 * 3, dtype=np.uint8).reshape(64, 64, 3)
+
+    transform = A.RandomRotate90(p=1.0, group_elements=("r90", "r270"))
+    transform.set_random_seed(137)
+
+    result = transform(image=image)["image"]
+
+    serialized = A.to_dict(transform)
+    deserialized = A.from_dict(serialized)
+
+    assert deserialized is not None
+    assert deserialized.group_elements == ("r90", "r270")
+
+    deserialized.set_random_seed(137)
+    deserialized_result = deserialized(image=image)["image"]
+
+    np.testing.assert_array_equal(result, deserialized_result)
+
+
+@pytest.mark.parametrize("group_element", ["e", "r90", "h", "t"])
+def test_square_symmetry_tta_same_as_d4(group_element):
+    """SquareSymmetry with group_element produces same result as D4."""
+    image = np.arange(64 * 64 * 3, dtype=np.uint8).reshape(64, 64, 3)
+    d4_result = A.D4(p=1.0, group_element=group_element)(image=image)["image"]
+    square_result = A.SquareSymmetry(p=1.0, group_element=group_element)(image=image)["image"]
+    np.testing.assert_array_equal(d4_result, square_result)
+
+
+@pytest.mark.parametrize("group_element", ["e", "r90", "r180", "r270", "v", "hvt", "h", "t"])
+def test_d4_inverse_roundtrip(group_element: str) -> None:
+    """Applying D4 then its inverse returns the original image."""
+    image = np.arange(64 * 64 * 3, dtype=np.uint8).reshape(64, 64, 3)
+    aug = A.D4(p=1, group_element=group_element)
+    augmented = aug(image=image)["image"]
+    restored = aug.inverse()(image=augmented)["image"]
+    np.testing.assert_array_equal(restored, image)
+    assert isinstance(aug.inverse(), A.D4)
+
+
+@pytest.mark.parametrize("group_element", ["e", "r90", "r180", "r270", "v", "hvt", "h", "t"])
+def test_square_symmetry_inverse_roundtrip(group_element: str) -> None:
+    """Applying SquareSymmetry then its inverse returns the original image."""
+    image = np.arange(64 * 64 * 3, dtype=np.uint8).reshape(64, 64, 3)
+    aug = A.SquareSymmetry(p=1, group_element=group_element)
+    augmented = aug(image=image)["image"]
+    restored = aug.inverse()(image=augmented)["image"]
+    np.testing.assert_array_equal(restored, image)
+    assert isinstance(aug.inverse(), A.SquareSymmetry)
+
+
+@pytest.mark.parametrize("group_element", ["e", "r90", "r180", "r270"])
+def test_random_rotate90_inverse_roundtrip(group_element: str) -> None:
+    """Applying RandomRotate90 then its inverse returns the original image."""
+    image = np.arange(64 * 64 * 3, dtype=np.uint8).reshape(64, 64, 3)
+    aug = A.RandomRotate90(p=1, group_element=group_element)
+    augmented = aug(image=image)["image"]
+    restored = aug.inverse()(image=augmented)["image"]
+    np.testing.assert_array_equal(restored, image)
+
+
+def test_random_rotate90_inverse_requires_group_element() -> None:
+    """inverse() on RandomRotate90 without group_element raises ValueError."""
+    aug = A.RandomRotate90(p=1)
+    with pytest.raises(ValueError, match="group_element"):
+        aug.inverse()
+
+
+def test_random_rotate90_inverse_requires_deterministic_group_element() -> None:
+    """inverse() on RandomRotate90 with group_elements raises ValueError."""
+    aug = A.RandomRotate90(p=1, group_elements=("r90", "r270"))
+    with pytest.raises(ValueError, match="group_element"):
+        aug.inverse()
+
+
+def test_d4_inverse_requires_group_element() -> None:
+    """inverse() on D4 without group_element raises ValueError."""
+    aug = A.D4(p=1)
+    with pytest.raises(ValueError, match="group_element"):
+        aug.inverse()
+
+
+@pytest.mark.parametrize(
+    "transform_cls",
+    [A.HorizontalFlip, A.VerticalFlip, A.Transpose],
+)
+def test_flip_inverse_roundtrip(transform_cls: type) -> None:
+    """Flips and Transpose are self-inverse: applying twice returns original."""
+    image = np.arange(64 * 64 * 3, dtype=np.uint8).reshape(64, 64, 3)
+    aug = transform_cls(p=1)
+    augmented = aug(image=image)["image"]
+    restored = aug.inverse()(image=augmented)["image"]
+    np.testing.assert_array_equal(restored, image)
+    assert isinstance(aug.inverse(), transform_cls)
+
+
+# ===========================================================================
+# LetterBox
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("input_shape", "target_size"),
+    [
+        ((480, 640, 3), (640, 640)),
+        ((640, 480, 3), (640, 640)),
+        ((100, 100, 3), (64, 128)),
+        ((100, 100, 3), (128, 64)),
+        ((200, 200, 3), (200, 200)),  # exact match, no resize or pad
+        ((300, 100, 3), (100, 100)),  # tall image
+    ],
+)
+def test_letterbox_output_shape(input_shape, target_size):
+    rng = np.random.default_rng(137)
+    image = rng.integers(0, 256, input_shape, dtype=np.uint8)
+    aug = A.Compose([A.LetterBox(size=target_size, p=1.0)])
+    result = aug(image=image)["image"]
+    assert result.shape[:2] == target_size, f"Expected {target_size}, got {result.shape[:2]}"
+
+
+@pytest.mark.parametrize("target_size", [(64, 64), (128, 96)])
+def test_letterbox_mask_output_shape(target_size):
+    rng = np.random.default_rng(137)
+    image = rng.integers(0, 256, (100, 150, 3), dtype=np.uint8)
+    mask = rng.integers(0, 2, (100, 150), dtype=np.uint8)
+    aug = A.Compose([A.LetterBox(size=target_size, p=1.0)])
+    result = aug(image=image, mask=mask)
+    assert result["image"].shape[:2] == target_size
+    assert result["mask"].shape[:2] == target_size
+
+
+@pytest.mark.parametrize(
+    "position",
+    ["center", "top_left", "top_right", "bottom_left", "bottom_right"],
+)
+def test_letterbox_positions(position):
+    rng = np.random.default_rng(137)
+    image = rng.integers(0, 256, (100, 150, 3), dtype=np.uint8)
+    aug = A.Compose([A.LetterBox(size=(200, 200), position=position, fill=114, p=1.0)])
+    result = aug(image=image)["image"]
+    assert result.shape == (200, 200, 3)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "fill_value"),
+    [(np.uint8, 114), (np.float32, 114 / 255)],
+)
+def test_letterbox_fill_value(dtype, fill_value):
+    """Padding region should be exactly the fill value."""
+    image = np.zeros((100, 200, 3), dtype=dtype)
+    target_size = (200, 200)
+    aug = A.Compose([A.LetterBox(size=target_size, fill=fill_value, position="top_left", p=1.0)])
+    result = aug(image=image)["image"]
+    # wide image (100x200) -> fits width exactly at scale=1, pad_top=50
+    pad_bottom = result[150:, :, :]
+    np.testing.assert_allclose(pad_bottom, fill_value)
+
+
+def test_letterbox_preserves_aspect_ratio():
+    """The resized content region must have the correct aspect ratio."""
+    image = np.ones((100, 200, 3), dtype=np.uint8) * 200
+    target_size = (300, 300)
+    aug = A.Compose([A.LetterBox(size=target_size, fill=0, position="center", p=1.0)])
+    result = aug(image=image)["image"]
+    # 100x200 -> scale=min(300/100, 300/200)=1.5 -> 150x300, pad_top=75
+    # center row should be 200, padding rows should be 0
+    np.testing.assert_array_equal(result[0, 0], 0)  # top padding
+    np.testing.assert_array_equal(result[150, 0], 200)  # image content
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+def test_letterbox_dtypes(dtype):
+    rng = np.random.default_rng(137)
+    if dtype == np.uint8:
+        image = rng.integers(0, 256, (80, 120, 3), dtype=np.uint8)
+    else:
+        image = rng.random((80, 120, 3), dtype=np.float32)
+    aug = A.Compose([A.LetterBox(size=(128, 128), p=1.0)])
+    result = aug(image=image)["image"]
+    assert result.dtype == dtype
+    assert result.shape == (128, 128, 3)
+
+
+def test_letterbox_bboxes():
+    """Bboxes should be adjusted correctly after letterboxing."""
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    # bbox covers the full image in pascal_voc coords
+    bboxes = np.array([[0.0, 0.0, 200.0, 100.0]])
+    bbox_labels = [1]
+    target_size = (200, 200)
+    aug = A.Compose(
+        [A.LetterBox(size=target_size, fill=0, position="center", p=1.0)],
+        bbox_params=A.BboxParams(coord_format="pascal_voc", label_fields=["bbox_labels"]),
+    )
+    result = aug(image=image, bboxes=bboxes, bbox_labels=bbox_labels)
+    out_bboxes = result["bboxes"]
+    assert len(out_bboxes) == 1
+    # image (100x200) -> scale=min(200/100, 200/200)=1.0 -> 100x200, pad_top=50, pad_bottom=50
+    # full-image bbox in padded space: (0,50,200,150)
+    out_x1, out_y1, out_x2, out_y2 = out_bboxes[0][:4]
+    np.testing.assert_allclose(out_x1, 0.0, atol=1e-4)
+    np.testing.assert_allclose(out_y1, 50.0, atol=1e-4)
+    np.testing.assert_allclose(out_x2, 200.0, atol=1e-4)
+    np.testing.assert_allclose(out_y2, 150.0, atol=1e-4)
+
+
+def test_letterbox_keypoints():
+    """Keypoints should be shifted by the padding offset."""
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    # keypoint at center of image
+    keypoints = np.array([[100.0, 50.0]])
+    keypoint_labels = [0]
+    target_size = (200, 200)
+    aug = A.Compose(
+        [A.LetterBox(size=target_size, fill=0, position="center", p=1.0)],
+        keypoint_params=A.KeypointParams(coord_format="xy", label_fields=["keypoint_labels"]),
+    )
+    result = aug(image=image, keypoints=keypoints, keypoint_labels=keypoint_labels)
+    out_kps = result["keypoints"]
+    assert len(out_kps) == 1
+    # scale=1.0, pad_top=50 -> kp moves from (100,50) to (100,100)
+    np.testing.assert_allclose(out_kps[0][0], 100.0, atol=1.0)
+    np.testing.assert_allclose(out_kps[0][1], 100.0, atol=1.0)
+
+
+def test_letterbox_equivalent_to_longestmaxsize_padifneeded():
+    """LetterBox must match LongestMaxSize + PadIfNeeded output pixel-for-pixel."""
+    rng = np.random.default_rng(137)
+    image = rng.integers(0, 256, (480, 640, 3), dtype=np.uint8)
+    target_size = (640, 640)
+    fill_val = 114
+
+    letterbox = A.Compose([A.LetterBox(size=target_size, fill=fill_val, position="center", p=1.0)])
+    composed = A.Compose(
+        [
+            A.LongestMaxSize(max_size=640),
+            A.PadIfNeeded(
+                min_height=640,
+                min_width=640,
+                border_mode=0,
+                fill=fill_val,
+                position="center",
+            ),
+        ],
+    )
+
+    lb_result = letterbox(image=image)["image"]
+    cp_result = composed(image=image)["image"]
+    np.testing.assert_array_equal(lb_result, cp_result)
+
+
+@pytest.mark.parametrize("method", ["bleach", "texture"])
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32])
+def test_random_snow_dtype_preservation(method, dtype):
+    # Use a non-uniform random image to properly test hue shift and texture logic
+    if dtype == np.float32:
+        img = np.random.rand(100, 100, 3).astype(np.float32)
+    else:
+        img = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+
+    transform = A.RandomSnow(p=1.0, method=method)
+    res = transform(image=img)["image"]
+
+    assert res.dtype == dtype, f"Expected {dtype}, got {res.dtype}"
+
+    # Assert the image actually changed (non-uniform input ensures this won't spuriously fail)
+    assert not np.array_equal(res, img), "Image was not modified by RandomSnow"
+
+    if dtype == np.float32:
+        assert res.min() >= 0.0
+        assert res.max() <= 1.0
+    else:
+        assert res.min() >= 0
+        assert res.max() <= 255
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float16, np.float32])
+@pytest.mark.parametrize("container", ["numpy", "tensor"])
+@pytest.mark.parametrize(
+    "target,shape",
+    [
+        ("image", (5, 7, 1)),
+        ("image", (5, 7, 3)),
+        ("images", (2, 5, 7, 3)),
+        ("volume", (3, 5, 7, 3)),
+        ("volumes", (2, 3, 5, 7, 3)),
+    ],
+)
+def test_color_jitter_zero_contrast_preserves_uniform_image(dtype, container, target, shape):
+    expected = np.full(shape, 64 if dtype == np.uint8 else 0.25, dtype=dtype)
+    source = numpy_to_tensor_spatial(expected.copy(), target) if container == "tensor" else expected.copy()
+    if container == "numpy":
+        source.flags.writeable = False
+    pipeline = A.Compose(
+        [
+            A.ColorJitter(
+                brightness_range=(1, 1),
+                contrast_range=(0, 0),
+                saturation_range=(1, 1),
+                hue_range=(0, 0),
+                p=1,
+            ),
+        ],
+        strict=True,
+        seed=137,
+    )
+
+    result = pipeline(**{target: source})[target]
+
+    assert type(result) is type(source)
+    actual = tensor_to_numpy_spatial(result, target) if container == "tensor" else result
+    original = tensor_to_numpy_spatial(source, target) if container == "tensor" else source
+    assert actual.dtype == expected.dtype
+    assert actual.shape == expected.shape
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(original, expected)
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float16, np.float32])
+@pytest.mark.parametrize("container", ["numpy", "tensor"])
+def test_color_jitter_grayscale_saturation_compose_preserves_channel(dtype, container):
+    expected = (
+        np.arange(17 * 13, dtype=np.uint8).reshape(17, 13, 1)
+        if dtype is np.uint8
+        else (np.arange(17 * 13, dtype=np.float32).reshape(17, 13, 1) / (17 * 13)).astype(dtype)
+    )
+    source = numpy_to_tensor_spatial(expected.copy(), "image") if container == "tensor" else expected.copy()
+    if container == "numpy":
+        source.flags.writeable = False
+
+    pipeline = A.Compose(
+        [
+            A.ColorJitter(
+                brightness_range=(1, 1),
+                contrast_range=(1, 1),
+                saturation_range=(0.5, 0.5),
+                hue_range=(0, 0),
+                p=1,
+            ),
+        ],
+        strict=True,
+        seed=137,
+    )
+
+    result = pipeline(image=source)["image"]
+
+    assert type(result) is type(source)
+    actual = tensor_to_numpy_spatial(result, "image") if container == "tensor" else result
+    original = tensor_to_numpy_spatial(source, "image") if container == "tensor" else source
+    assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(original, expected)
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float16, np.float32])
+@pytest.mark.parametrize("container", ["numpy", "tensor"])
+@pytest.mark.parametrize("channels", [1, 3, 5])
+def test_posterize_compose_keeps_explicit_channels_and_dtype(dtype, container, channels):
+    rng = np.random.default_rng(137)
+    uint8_image = rng.integers(0, 256, (33, 41, channels), dtype=np.uint8)
+    if dtype is np.uint8:
+        image = uint8_image
+    else:
+        half_image = (uint8_image.astype(np.float32) / 255).astype(np.float16)
+        image = half_image if dtype is np.float16 else half_image.astype(np.float32)
+    original = image.copy()
+    source = numpy_to_tensor_spatial(image.copy(), "image") if container == "tensor" else image.copy()
+    if container == "numpy":
+        source.flags.writeable = False
+
+    result = A.Compose([A.Posterize(num_bits=(4, 4), p=1.0)], seed=137, strict=True)(image=source)["image"]
+
+    assert type(result) is type(source)
+    actual = tensor_to_numpy_spatial(result, "image") if container == "tensor" else result
+    preserved = tensor_to_numpy_spatial(source, "image") if container == "tensor" else source
+    uint8_input = image if dtype is np.uint8 else from_float(image, np.dtype(np.uint8))
+    expected_uint8 = np.bitwise_and(uint8_input, np.uint8(0xF0))
+    expected = expected_uint8 if dtype is np.uint8 else to_float(expected_uint8).astype(dtype)
+    assert actual.shape == image.shape
+    assert actual.dtype == dtype
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(preserved, original)
+    if dtype is np.float16:
+        float32_image = image.astype(np.float32)
+        float32_source = numpy_to_tensor_spatial(float32_image, "image") if container == "tensor" else float32_image
+        float32_result = A.Compose([A.Posterize(num_bits=(4, 4), p=1.0)], seed=137, strict=True)(
+            image=float32_source,
+        )["image"]
+        if container == "tensor":
+            float32_result = tensor_to_numpy_spatial(float32_result, "image")
+        np.testing.assert_array_equal(actual, float32_result.astype(np.float16))
+
+
+@pytest.mark.parametrize("channels", [1, 3])
+@pytest.mark.parametrize("dtype", [np.uint8, np.float16, np.float32])
+@pytest.mark.parametrize("container", ["numpy", "tensor"])
+def test_solarize_compose_preserves_dtype_and_explicit_channel(channels, dtype, container):
+    rng = np.random.default_rng(137)
+    uint8_image = rng.integers(0, 256, (33, 41, channels), dtype=np.uint8)
+    if dtype is np.uint8:
+        image = uint8_image
+    else:
+        half_image = (uint8_image.astype(np.float32) / 255).astype(np.float16)
+        image = half_image if dtype is np.float16 else half_image.astype(np.float32)
+    original = image.copy()
+    source = numpy_to_tensor_spatial(image.copy(), "image") if container == "tensor" else image.copy()
+    if container == "numpy":
+        source.flags.writeable = False
+
+    threshold = 0.35
+    result = A.Compose(
+        [A.Solarize(threshold_range=(threshold, threshold), p=1.0)],
+        seed=137,
+        strict=True,
+    )(image=source)["image"]
+    expected = fpixel.solarize(image, threshold)
+
+    assert type(result) is type(source)
+    actual = tensor_to_numpy_spatial(result, "image") if container == "tensor" else result
+    preserved = tensor_to_numpy_spatial(source, "image") if container == "tensor" else source
+    assert actual.shape == image.shape
+    assert actual.dtype == dtype
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(preserved, original)
+    if dtype is np.float16:
+        float32_image = image.astype(np.float32)
+        float32_source = numpy_to_tensor_spatial(float32_image, "image") if container == "tensor" else float32_image
+        float32_result = A.Compose(
+            [A.Solarize(threshold_range=(threshold, threshold), p=1.0)],
+            seed=137,
+            strict=True,
+        )(image=float32_source)["image"]
+        if container == "tensor":
+            float32_result = tensor_to_numpy_spatial(float32_result, "image")
+        np.testing.assert_array_equal(actual, float32_result.astype(np.float16))
+
+
+@pytest.mark.parametrize("method", ["desaturation", "pca"])
+@pytest.mark.parametrize("dtype", [np.uint8, np.float16, np.float32])
+@pytest.mark.parametrize("container", ["numpy", "tensor"])
+def test_to_gray_compose_returns_explicit_channel_for_float16(method, dtype, container):
+    rng = np.random.default_rng(137)
+    uint8_image = rng.integers(0, 256, (33, 41, 3), dtype=np.uint8)
+    if dtype is np.uint8:
+        image = uint8_image
+    else:
+        half_image = (uint8_image.astype(np.float32) / 255).astype(np.float16)
+        image = half_image if dtype is np.float16 else half_image.astype(np.float32)
+    original = image.copy()
+    source = numpy_to_tensor_spatial(image.copy(), "image") if container == "tensor" else image.copy()
+    if container == "numpy":
+        source.flags.writeable = False
+
+    transform = A.Compose(
+        [A.ToGray(method=method, num_output_channels=1, p=1.0)],
+        seed=137,
+        strict=True,
+    )
+    result = transform(image=source)["image"]
+    expected = fpixel.to_gray_desaturation(image) if method == "desaturation" else fpixel.to_gray_pca(image)
+
+    assert type(result) is type(source)
+    actual = tensor_to_numpy_spatial(result, "image") if container == "tensor" else result
+    preserved = tensor_to_numpy_spatial(source, "image") if container == "tensor" else source
+    assert actual.shape == (*image.shape[:2], 1)
+    assert actual.dtype == dtype
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(preserved, original)
+    if dtype is np.float16:
+        float32_image = image.astype(np.float32)
+        float32_source = numpy_to_tensor_spatial(float32_image, "image") if container == "tensor" else float32_image
+        float32_result = A.Compose(
+            [A.ToGray(method=method, num_output_channels=1, p=1.0)],
+            seed=137,
+            strict=True,
+        )(image=float32_source)["image"]
+        if container == "tensor":
+            float32_result = tensor_to_numpy_spatial(float32_result, "image")
+        np.testing.assert_array_equal(actual, float32_result.astype(np.float16))

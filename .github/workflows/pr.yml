@@ -1,0 +1,670 @@
+name: PR
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
+  workflow_dispatch:
+    inputs:
+      pull-request:
+        description: Same-repository pull request to validate after a registry synchronization
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pull-request }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: PR plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      compatibility: ${{ steps.plan.outputs.compatibility }}
+      targeted: ${{ steps.plan.outputs.targeted }}
+      pytorch: ${{ steps.plan.outputs.pytorch }}
+      dependency_audit: ${{ steps.plan.outputs.dependency_audit }}
+      workflow_audit: ${{ steps.plan.outputs.workflow_audit }}
+      legal: ${{ steps.plan.outputs.legal }}
+      package: ${{ steps.plan.outputs.package }}
+      release_preflight: ${{ steps.plan.outputs.release_preflight }}
+      pytest_targets: ${{ steps.plan.outputs.pytest_targets }}
+      version_change: ${{ steps.plan.outputs.version_change }}
+    steps:
+      - name: Checkout pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up plan environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: "3.12"
+          dependency-group: ci-quality
+
+      - name: Resolve dispatched pull request
+        if: github.event_name == 'workflow_dispatch'
+        id: dispatched
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pull-request }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '
+            if .state == "open" and .base.ref == "main" and
+               .head.repo.full_name == env.GITHUB_REPOSITORY and .head.sha == env.GITHUB_SHA
+            then "base_sha=\(.base.sha)", "head_sha=\(.head.sha)", "draft=\(.draft)",
+                 "force_full=\(.labels | any(.name == "full-ci"))"
+            else error("Dispatched commit must be the current head of an open same-repository PR against main")
+            end' >> "$GITHUB_OUTPUT"
+
+      - name: Collect changed paths
+        env:
+          BASE_SHA: ${{ steps.dispatched.outputs.base_sha || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ steps.dispatched.outputs.head_sha || github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p ci-plan
+          git diff --name-only -z "${BASE_SHA}" "${HEAD_SHA}" -- > ci-plan/changed-files.z
+          git show "${BASE_SHA}:pyproject.toml" > ci-plan/base-pyproject.toml
+          cp pyproject.toml ci-plan/head-pyproject.toml
+          git show "${BASE_SHA}:uv.lock" > ci-plan/base-uv.lock
+          cp uv.lock ci-plan/head-uv.lock
+
+      - name: Select pull-request checks
+        id: plan
+        env:
+          DRAFT: ${{ steps.dispatched.outputs.draft || github.event.pull_request.draft }}
+          FORCE_FULL: ${{ steps.dispatched.outputs.force_full || contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+        run: >-
+          python -m tools.ci_plan
+          --paths-file ci-plan/changed-files.z --null
+          --base-pyproject ci-plan/base-pyproject.toml
+          --head-pyproject ci-plan/head-pyproject.toml
+          --base-lock ci-plan/base-uv.lock
+          --head-lock ci-plan/head-uv.lock
+          --draft "${DRAFT}" --force-full "${FORCE_FULL}"
+          --github-output "${GITHUB_OUTPUT}"
+          --summary "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload routing evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr-ci-plan
+          path: ci-plan/
+          if-no-files-found: error
+          retention-days: 7
+
+  pre_commit_ruff:
+    name: Pre-commit / Ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up quality environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: "3.12"
+          dependency-group: ci-quality
+      - name: Run Ruff hook
+        run: pre-commit run ruff --all-files --show-diff-on-failure
+
+  pre_commit_ruff_format:
+    name: Pre-commit / Ruff format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up quality environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: "3.12"
+          dependency-group: ci-quality
+      - name: Run Ruff format hook
+        run: pre-commit run ruff-format --all-files --show-diff-on-failure
+
+  pre_commit_mypy:
+    name: Pre-commit / mypy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up quality environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: "3.11"
+          dependency-group: ci-types
+          runtime-profile: torch-cpu
+      - name: Run mypy hook
+        run: pre-commit run mypy --all-files --show-diff-on-failure
+      - name: Check positive and negative typing contracts
+        run: uv run --no-sync python -m unittest discover -s tests/typing -p check_contracts.py
+
+  pre_commit_pyrefly:
+    name: Pre-commit / Pyrefly
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up typing environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: "3.11"
+          dependency-group: ci-types
+          runtime-profile: torch-cpu
+      - name: Run Pyrefly hook
+        run: pre-commit run pyrefly-check --all-files --show-diff-on-failure
+
+  pre_commit_other:
+    name: Pre-commit / Other hooks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up quality environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: "3.12"
+          dependency-group: ci-quality
+          runtime-profile: torch-cpu
+      - name: Run all remaining hooks
+        env:
+          SKIP: ruff,ruff-format,mypy,pyrefly-check
+        run: pre-commit run --all-files --show-diff-on-failure
+
+  compatibility:
+    name: Compatibility (${{ matrix.operating-system }}, Python ${{ matrix.python-version }})
+    needs: plan
+    if: needs.plan.outputs.compatibility == 'true'
+    runs-on: ${{ matrix.operating-system }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        operating-system: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up test environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: ${{ matrix.python-version }}
+          dependency-group: ci-test
+          runtime-profile: torch-cpu
+      - name: Run complete base suite
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p ci-evidence
+          python -m tools.ci_shard select \
+            --shard-count 1 \
+            --shard-index 0 \
+            --exclude-file tests/test_pytorch.py \
+            --exclude-file tests/transforms3d/test_pytorch.py \
+            | xargs -0 python -m pytest \
+            -n 2 --dist=worksteal -m "not pytorch" \
+            --hypothesis-profile=ci-fast \
+            --junitxml=ci-evidence/junit.xml
+      - name: Enforce Linux memory budgets
+        if: runner.os == 'Linux' && matrix.python-version == '3.11'
+        run: python tools/check_memory.py --output ci-evidence/memory-budget.json
+      - name: Collect test environment evidence
+        if: always()
+        shell: bash
+        run: >-
+          python tools/collect_test_environment.py
+          --output ci-evidence/environment.json
+          --command "python -m pytest -n 2 --dist=worksteal -m not-pytorch"
+      - name: Summarize pytest results
+        if: always()
+        run: >-
+          python tools/pytest_summary.py
+          --junit ci-evidence/junit.xml
+          --output ci-evidence/pytest-summary.json
+          --allow-incomplete
+      - name: Upload compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compatibility-${{ matrix.operating-system }}-${{ matrix.python-version }}
+          path: ci-evidence/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  targeted:
+    name: Targeted tests (${{ matrix.operating-system }}, Python ${{ matrix.python-version }})
+    needs: plan
+    if: needs.plan.outputs.targeted == 'true'
+    runs-on: ${{ matrix.operating-system }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - operating-system: ubuntu-latest
+            python-version: "3.12"
+          - operating-system: windows-latest
+            python-version: "3.11"
+          - operating-system: windows-latest
+            python-version: "3.14"
+          - operating-system: macos-latest
+            python-version: "3.11"
+          - operating-system: macos-latest
+            python-version: "3.14"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up test environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: ${{ matrix.python-version }}
+          dependency-group: ci-test
+          runtime-profile: torch-cpu
+      - name: Run changed test modules
+        env:
+          PYTEST_TARGETS: ${{ needs.plan.outputs.pytest_targets }}
+        shell: bash
+        run: |
+          python -c 'import json, os, pathlib; pathlib.Path("targets.z").write_bytes(b"\0".join(path.encode() for path in json.loads(os.environ["PYTEST_TARGETS"])) + b"\0")'
+          xargs -0 python -m pytest \
+            -n 2 --dist=worksteal -m "not pytorch" --hypothesis-profile=ci-fast \
+            < targets.z
+
+  pytorch:
+    name: PyTorch tests
+    needs: plan
+    if: needs.plan.outputs.pytorch == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up PyTorch test environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: "3.12"
+          dependency-group: ci-test
+          runtime-profile: torch-cpu
+      - name: Run PyTorch-marked tests
+        run: >-
+          python -m pytest -n 2 --dist=worksteal -m pytorch
+          tests/test_pytorch.py
+          tests/transforms3d/test_pytorch.py
+          tests/test_per_worker_seed.py
+          tests/test_flip_masks_comprehensive.py
+          tests/test_additional_targets.py
+
+  dependency_audit:
+    name: Dependency audit
+    needs: plan
+    if: needs.plan.outputs.dependency_audit == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up security environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: "3.12"
+          dependency-group: ci-security
+      - name: Export locked runtime dependencies
+        run: >-
+          uv export --frozen --no-dev --no-emit-project
+          --format requirements-txt --output-file runtime-requirements.txt
+      - name: Export locked optional runtime dependencies
+        run: >-
+          uv export --frozen --no-dev --all-extras --no-emit-project
+          --format requirements-txt --output-file all-runtime-requirements.txt
+      - name: Check reviewed runtime dependency licenses
+        run: >-
+          python tools/verify_dependency_licenses.py
+          --requirements runtime-requirements.txt
+      - name: Audit locked runtime dependencies
+        if: ${{ !cancelled() && hashFiles('runtime-requirements.txt') != '' && hashFiles('all-runtime-requirements.txt') != '' }}
+        run: >-
+          pip-audit --requirement runtime-requirements.txt
+          --requirement all-runtime-requirements.txt
+          --no-deps --disable-pip --format=json --output dependency-audit.json
+      - name: Upload dependency audit evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dependency-audit-evidence
+          path: dependency-audit.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  workflow_audit:
+    name: GitHub Actions hardening audit
+    needs: plan
+    if: needs.plan.outputs.workflow_audit == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up security environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: "3.12"
+          dependency-group: ci-security
+      - name: Run zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --format=github --min-severity=medium --min-confidence=medium .github
+
+  legal:
+    name: Legal source integrity
+    needs: plan
+    if: needs.plan.outputs.legal == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up package environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: "3.12"
+          dependency-group: ci-package
+      - name: Verify source-tree legal integrity
+        run: python tools/verify_legal_integrity.py
+      - name: Test legal-integrity verifier
+        run: python -m pytest --noconftest -q tests/test_legal_integrity.py
+
+  package:
+    name: Package artifacts
+    needs: plan
+    if: needs.plan.outputs.package == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up package environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: "3.12"
+          dependency-group: ci-package
+      - name: Build wheel and source distribution
+        run: uv build --out-dir dist
+      - name: Verify packaged legal notices
+        run: python tools/verify_legal_integrity.py --artifacts dist/*.whl dist/*.tar.gz
+      - name: Check distribution metadata
+        run: twine check dist/*
+
+  release_preflight:
+    name: Release preflight
+    needs: plan
+    if: needs.plan.outputs.release_preflight == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up exact release environment
+        uses: ./.github/actions/setup-ci
+        with:
+          python-version: "3.12"
+          dependency-group: ci-release
+          runtime-profile: torch-cpu
+      - name: Prepare release bundle
+        id: metadata
+        run: |
+          mkdir -p \
+            "${RUNNER_TEMP}/release-bundle/dist" \
+            "${RUNNER_TEMP}/release-bundle/evidence" \
+            "${RUNNER_TEMP}/release-bundle/public"
+          python -m tools.release_bundle metadata \
+            --source-root . \
+            --github-output "${GITHUB_OUTPUT}"
+      - name: Build final distributions
+        run: uv build --out-dir "${RUNNER_TEMP}/release-bundle/dist"
+      - name: Verify distribution license and notice integrity
+        run: >-
+          python tools/verify_legal_integrity.py
+          --artifacts "${RUNNER_TEMP}"/release-bundle/dist/*.whl "${RUNNER_TEMP}"/release-bundle/dist/*.tar.gz
+      - name: Check final distribution metadata
+        run: twine check "${RUNNER_TEMP}"/release-bundle/dist/*
+      - name: Prepare Torch-free final wheel environment
+        id: release-install-contract
+        run: >-
+          python tools/install_contract.py prepare
+          --wheel "${RUNNER_TEMP}"/release-bundle/dist/*.whl --python "3.12"
+      - name: Install and verify CPU-only Torch
+        uses: albumentations-team/ci-foundation/actions/torch-cpu@6b9045dbea58026a1e8f96b0392c411934a27199
+        with:
+          mode: install
+          python: ${{ steps.release-install-contract.outputs.python }}
+          requirement: "torch>=2.13.0"
+      - name: Smoke test final wheel with CPU-only Torch
+        run: >-
+          python tools/install_contract.py smoke
+          --python "${{ steps.release-install-contract.outputs.python }}"
+      - name: Verify lock freshness
+        run: uv lock --check
+      - name: Collect release environment evidence
+        run: >-
+          python tools/collect_test_environment.py
+          --output "${RUNNER_TEMP}/release-bundle/evidence/environment-release.json"
+          --command "version-bump PR release preflight"
+      - name: Run release correctness evidence tests
+        run: |
+          python tools/verify_regression_vectors.py --all
+          python -m pytest -q tests/regression tests/property \
+            --hypothesis-profile=ci-fast \
+            --junitxml="${RUNNER_TEMP}/release-bundle/evidence/junit-release.xml"
+      - name: Summarize release pytest results
+        if: always()
+        run: >-
+          python tools/pytest_summary.py
+          --junit "${RUNNER_TEMP}/release-bundle/evidence/junit-release.xml"
+          --output "${RUNNER_TEMP}/release-bundle/evidence/pytest-summary-release.json"
+          --allow-incomplete
+      - name: Collect core benchmark coverage evidence
+        run: |
+          python -m tools.benchmark_coverage summary \
+            --output "${RUNNER_TEMP}/release-bundle/evidence/benchmark-coverage-release.json"
+          python -m tools.benchmark_coverage details \
+            --output "${RUNNER_TEMP}/release-bundle/evidence/benchmark-coverage-detail-release.json"
+      - name: Enforce release memory budgets
+        run: >-
+          python tools/check_memory.py
+          --output "${RUNNER_TEMP}/release-bundle/evidence/memory-budget.json"
+      - name: Register release ASV machine profile
+        working-directory: benchmark
+        run: asv --config asv.conf.json machine --yes
+      - name: Compare previous release with release candidate
+        working-directory: benchmark
+        env:
+          RELEASE_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -o pipefail
+          CANDIDATE_REF="${RELEASE_HEAD_SHA:-HEAD}"
+          BASELINE_REF="$(git describe --tags --abbrev=0 --match '[0-9]*' "$CANDIDATE_REF^")"
+          BASELINE_SHA="$(git rev-parse "$BASELINE_REF")"
+          CANDIDATE_SHA="$(git rev-parse "$CANDIDATE_REF")"
+          BENCH_FILTER="$(python "$GITHUB_WORKSPACE/tools/select_benchmark_filters.py" --profile release-core)"
+          EVIDENCE_DIR="${RUNNER_TEMP}/release-bundle/evidence"
+          printf '%s\n' "$BASELINE_REF" > "$EVIDENCE_DIR/benchmark-baseline-ref.txt"
+          printf '%s\n' "$BASELINE_SHA" > "$EVIDENCE_DIR/benchmark-baseline-sha.txt"
+          printf '%s\n' "$CANDIDATE_REF" > "$EVIDENCE_DIR/benchmark-candidate-ref.txt"
+          printf '%s\n' "$CANDIDATE_SHA" > "$EVIDENCE_DIR/benchmark-candidate-sha.txt"
+          printf '%s\n' "$BENCH_FILTER" > "$EVIDENCE_DIR/benchmark-filter.txt"
+          ASV_EXIT_CODE=0
+          asv --config asv.conf.json continuous \
+            --factor 1.05 --split --show-stderr \
+            --attribute repeat=1 --attribute number=1 \
+            --bench "$BENCH_FILTER" "$BASELINE_REF" "$CANDIDATE_REF" \
+            2>&1 | tee "$EVIDENCE_DIR/asv-continuous.txt" || ASV_EXIT_CODE=$?
+          printf '%s\n' "$ASV_EXIT_CODE" > "$EVIDENCE_DIR/asv-continuous-exit-code.txt"
+      - name: Summarize release ASV comparison
+        if: always()
+        run: |
+          EVIDENCE_DIR="${RUNNER_TEMP}/release-bundle/evidence"
+          ASV_EXIT_CODE="$(cat "$EVIDENCE_DIR/asv-continuous-exit-code.txt" 2>/dev/null || true)"
+          python tools/asv_summary.py \
+            --input "$EVIDENCE_DIR/asv-continuous.txt" \
+            --output "$EVIDENCE_DIR/benchmark-asv-summary.json" \
+            --asv-exit-code "${ASV_EXIT_CODE:-1}"
+      - name: Classify strict release performance budget
+        if: always()
+        run: >
+          python -m tools.performance_budget summarize
+          --coverage-summary "${RUNNER_TEMP}/release-bundle/evidence/benchmark-coverage-release.json"
+          --coverage-detail "${RUNNER_TEMP}/release-bundle/evidence/benchmark-coverage-detail-release.json"
+          --asv-summary "${RUNNER_TEMP}/release-bundle/evidence/benchmark-asv-summary.json"
+          --core-only
+          --require-comparison
+          --fail-on-release-blockers
+          --output "${RUNNER_TEMP}/release-bundle/evidence/benchmark-performance-budget-release.json"
+      - name: Export locked runtime dependencies
+        run: >-
+          uv export --frozen --no-dev --no-emit-project
+          --format requirements-txt
+          --output-file "${RUNNER_TEMP}/release-bundle/evidence/runtime-requirements.txt"
+      - name: Collect release security evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pip-audit \
+            --requirement "${RUNNER_TEMP}/release-bundle/evidence/runtime-requirements.txt" \
+            --no-deps \
+            --disable-pip \
+            --format=json \
+            --output "${RUNNER_TEMP}/release-bundle/evidence/security-pip-audit.json"
+          zizmor \
+            --format=json \
+            --min-severity=medium \
+            --min-confidence=medium \
+            .github > "${RUNNER_TEMP}/release-bundle/evidence/security-zizmor.json"
+      - name: Collect installed dependency license evidence
+        run: >-
+          cyclonedx-py environment "$(command -v python)"
+          --pyproject pyproject.toml
+          --mc-type library
+          --output-reproducible
+          --output-file "${RUNNER_TEMP}/release-bundle/evidence/dependency-licenses.cdx.json"
+      - name: Generate CycloneDX SBOM
+        env:
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.package_version }}
+        run: >-
+          cyclonedx-py requirements "${RUNNER_TEMP}/release-bundle/evidence/runtime-requirements.txt"
+          --output-format JSON
+          --output-file
+          "${RUNNER_TEMP}/release-bundle/public/albumentationsx-${PACKAGE_VERSION}-sbom.cdx.json"
+      - name: Add reviewed licenses to CycloneDX SBOM
+        env:
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.package_version }}
+        run: >-
+          python tools/verify_dependency_licenses.py
+          --requirements "${RUNNER_TEMP}/release-bundle/evidence/runtime-requirements.txt"
+          --license-sbom "${RUNNER_TEMP}/release-bundle/evidence/dependency-licenses.cdx.json"
+          --sbom "${RUNNER_TEMP}/release-bundle/public/albumentationsx-${PACKAGE_VERSION}-sbom.cdx.json"
+          --write-sbom
+      - name: Generate correctness and compatibility report
+        env:
+          PACKAGE_VERSION: ${{ steps.metadata.outputs.package_version }}
+        run: >-
+          python tools/generate_correctness_report.py
+          --evidence-dir "${RUNNER_TEMP}/release-bundle/evidence"
+          --output
+          "${RUNNER_TEMP}/release-bundle/public/albumentationsx-${PACKAGE_VERSION}-correctness-compatibility-report.md"
+      - name: Finalize immutable release bundle
+        id: finalize
+        run: >-
+          python -m tools.release_bundle finalize
+          --bundle-dir "${RUNNER_TEMP}/release-bundle"
+          --source-root .
+          --check clean_install
+          --check correctness
+          --check legal
+          --check lock
+          --check package
+          --check performance_core
+          --check report
+          --check security
+          --retention-days 90
+          --github-output "${GITHUB_OUTPUT}"
+      - name: Upload publishable release bundle
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.finalize.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-bundle/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 90
+      - name: Upload failed preflight diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-diagnostics-${{ steps.metadata.outputs.package_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-bundle/evidence/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  gate:
+    name: PR gate
+    needs:
+      - plan
+      - pre_commit_ruff
+      - pre_commit_ruff_format
+      - pre_commit_mypy
+      - pre_commit_pyrefly
+      - pre_commit_other
+      - compatibility
+      - targeted
+      - pytorch
+      - dependency_audit
+      - workflow_audit
+      - legal
+      - package
+      - release_preflight
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate routed results
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          PLAN_COMPATIBILITY: ${{ needs.plan.outputs.compatibility }}
+          PLAN_TARGETED: ${{ needs.plan.outputs.targeted }}
+          PLAN_PYTORCH: ${{ needs.plan.outputs.pytorch }}
+          PLAN_DEPENDENCY_AUDIT: ${{ needs.plan.outputs.dependency_audit }}
+          PLAN_WORKFLOW_AUDIT: ${{ needs.plan.outputs.workflow_audit }}
+          PLAN_LEGAL: ${{ needs.plan.outputs.legal }}
+          PLAN_PACKAGE: ${{ needs.plan.outputs.package }}
+          PLAN_RELEASE_PREFLIGHT: ${{ needs.plan.outputs.release_preflight }}
+          RESULT_PRE_COMMIT_RUFF: ${{ needs.pre_commit_ruff.result }}
+          RESULT_PRE_COMMIT_RUFF_FORMAT: ${{ needs.pre_commit_ruff_format.result }}
+          RESULT_PRE_COMMIT_MYPY: ${{ needs.pre_commit_mypy.result }}
+          RESULT_PRE_COMMIT_PYREFLY: ${{ needs.pre_commit_pyrefly.result }}
+          RESULT_PRE_COMMIT_OTHER: ${{ needs.pre_commit_other.result }}
+          RESULT_COMPATIBILITY: ${{ needs.compatibility.result }}
+          RESULT_TARGETED: ${{ needs.targeted.result }}
+          RESULT_PYTORCH: ${{ needs.pytorch.result }}
+          RESULT_DEPENDENCY_AUDIT: ${{ needs.dependency_audit.result }}
+          RESULT_WORKFLOW_AUDIT: ${{ needs.workflow_audit.result }}
+          RESULT_LEGAL: ${{ needs.legal.result }}
+          RESULT_PACKAGE: ${{ needs.package.result }}
+          RESULT_RELEASE_PREFLIGHT: ${{ needs.release_preflight.result }}
+        run: python -m tools.ci_gate

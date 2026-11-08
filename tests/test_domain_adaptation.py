@@ -1,0 +1,738 @@
+import numpy as np
+import pytest
+from skimage.exposure import match_histograms as skimage_match_histograms
+from skimage.metrics import structural_similarity as ssim
+
+import albumentations as A
+from albumentations.augmentations.mixing.domain_adaptation_functional import (
+    PCA,
+    MinMaxScaler,
+    StandardScaler,
+    adapt_pixel_distribution,
+    apply_histogram,
+    fourier_domain_adaptation,
+)
+from albumentations.augmentations.mixing.domain_adaptation_functional import match_histograms as our_match_histograms
+from albumentations.core.tensor import numpy_to_tensor_spatial, tensor_to_numpy_spatial
+
+
+@pytest.mark.parametrize(
+    "feature_range, data, expected",
+    [
+        ((0.0, 1.0), np.array([[1, 2], [3, 4], [5, 6]]), np.array([[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]])),
+        ((-1.0, 1.0), np.array([[1, 2], [3, 4], [5, 6]]), np.array([[-1.0, -1.0], [0.0, 0.0], [1.0, 1.0]])),
+        (
+            (0.0, 1.0),
+            np.array([[1, 1], [1, 1], [1, 1]]),
+            np.array([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]),
+        ),  # edge case: all values are the same
+    ],
+)
+def test_minmax_scaler(feature_range, data, expected):
+    scaler = MinMaxScaler(feature_range)
+    result = scaler.fit_transform(data)
+    np.testing.assert_almost_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "feature_range, data, data_scaled, expected",
+    [
+        (
+            (0.0, 1.0),
+            np.array([[1, 2], [3, 4], [5, 6]]),
+            np.array([[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]]),
+            np.array([[1, 2], [3, 4], [5, 6]]),
+        ),
+        (
+            (-1.0, 1.0),
+            np.array([[1, 2], [3, 4], [5, 6]]),
+            np.array([[-1.0, -1.0], [0.0, 0.0], [1.0, 1.0]]),
+            np.array([[1, 2], [3, 4], [5, 6]]),
+        ),
+    ],
+)
+def test_minmax_inverse_transform(feature_range, data, data_scaled, expected):
+    scaler = MinMaxScaler(feature_range)
+    scaler.fit(data)
+    result = scaler.inverse_transform(data_scaled)
+    np.testing.assert_almost_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "data, expected",
+    [
+        (
+            np.array([[1, 2], [3, 4], [5, 6]]),
+            np.array([[-1.22474487, -1.22474487], [0.0, 0.0], [1.22474487, 1.22474487]]),
+        ),
+        (
+            np.array([[1, 1], [1, 1], [1, 1]]),
+            np.array([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]),
+        ),  # edge case: all values are the same
+    ],
+)
+def test_standard_scaler(data, expected):
+    scaler = StandardScaler()
+    result = scaler.fit_transform(data)
+    np.testing.assert_almost_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "data, data_scaled, expected",
+    [
+        (
+            np.array([[1, 2], [3, 4], [5, 6]]),
+            np.array([[-1.22474487, -1.22474487], [0.0, 0.0], [1.22474487, 1.22474487]]),
+            np.array([[1, 2], [3, 4], [5, 6]]),
+        ),
+    ],
+)
+def test_standard_inverse_transform(data, data_scaled, expected):
+    scaler = StandardScaler()
+    scaler.fit(data)
+    result = scaler.inverse_transform(data_scaled)
+    np.testing.assert_allclose(result, expected, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("scaler_cls", [MinMaxScaler, StandardScaler])
+def test_scalers_use_float32_working_arrays(scaler_cls):
+    data = np.array([[1, 2], [3, 4], [5, 6]], dtype=np.uint8)
+    scaler = scaler_cls()
+
+    transformed = scaler.fit_transform(data)
+    reconstructed = scaler.inverse_transform(transformed)
+
+    assert transformed.dtype == np.float32
+    assert reconstructed.dtype == np.float32
+    np.testing.assert_allclose(reconstructed, data)
+
+
+@pytest.mark.parametrize(
+    "n_components, data, expected_shape",
+    [
+        (
+            1,
+            np.array(
+                [
+                    [2.5, 2.4],
+                    [0.5, 0.7],
+                    [2.2, 2.9],
+                    [1.9, 2.2],
+                    [3.1, 3.0],
+                    [2.3, 2.7],
+                    [2.0, 1.6],
+                    [1.0, 1.1],
+                    [1.5, 1.6],
+                    [1.1, 0.9],
+                ],
+            ),
+            (10, 1),
+        ),
+        (
+            2,
+            np.array(
+                [
+                    [2.5, 2.4],
+                    [0.5, 0.7],
+                    [2.2, 2.9],
+                    [1.9, 2.2],
+                    [3.1, 3.0],
+                    [2.3, 2.7],
+                    [2.0, 1.6],
+                    [1.0, 1.1],
+                    [1.5, 1.6],
+                    [1.1, 0.9],
+                ],
+            ),
+            (10, 2),
+        ),
+    ],
+)
+def test_pca_transform(n_components, data, expected_shape):
+    pca = PCA(n_components)
+    transformed = pca.fit_transform(data)
+    assert transformed.shape == expected_shape
+    assert np.all(np.isfinite(transformed)), "Transformed data contains non-finite values"
+
+
+def test_pca_configurable_computation_dtype():
+    data = np.random.default_rng(137).random((32, 3), dtype=np.float32)
+
+    default_pca = PCA(n_components=2)
+    default_result = default_pca.fit_transform(data)
+    float32_pca = PCA(n_components=2, dtype=np.float32)
+    float32_result = float32_pca.fit_transform(data)
+
+    assert default_result.dtype == np.float64
+    assert float32_result.dtype == np.float32
+    assert float32_pca.mean is not None and float32_pca.mean.dtype == np.float32
+    assert float32_pca.components_ is not None and float32_pca.components_.dtype == np.float32
+
+
+@pytest.mark.parametrize(
+    "n_components, data, expected_transformed, expected_inverse",
+    [
+        (
+            1,
+            np.array(
+                [
+                    [2.5, 2.4],
+                    [0.5, 0.7],
+                    [2.2, 2.9],
+                    [1.9, 2.2],
+                    [3.1, 3.0],
+                    [2.3, 2.7],
+                    [2.0, 1.6],
+                    [1.0, 1.1],
+                    [1.5, 1.6],
+                    [1.1, 0.9],
+                ],
+            ),
+            np.array(
+                [
+                    [0.8279701862010879],
+                    [-1.7775803252804292],
+                    [0.9921974944148886],
+                    [0.27421041597539936],
+                    [1.6758014186445398],
+                    [0.9129491031588081],
+                    [-0.09910943749844434],
+                    [-1.1445721637986601],
+                    [-0.4380461367624502],
+                    [-1.2238205550547405],
+                ],
+            ),
+            np.array(
+                [
+                    [2.3712589640000026, 2.518706008322169],
+                    [0.6050255837456271, 0.6031608863381424],
+                    [2.4825842875499986, 2.639442419978468],
+                    [1.995879946589024, 2.111593644953067],
+                    [2.9459812029146377, 3.142013433918504],
+                    [2.428863911241362, 2.5811806942407656],
+                    [1.7428163487767303, 1.837136856988131],
+                    [1.0341249774652423, 1.068534975444947],
+                    [1.5130601765607719, 1.58795783010856],
+                    [0.9804046011566055, 1.0102732497072444],
+                ],
+            ),
+        ),
+        (
+            2,
+            np.array(
+                [
+                    [2.5, 2.4],
+                    [0.5, 0.7],
+                    [2.2, 2.9],
+                    [1.9, 2.2],
+                    [3.1, 3.0],
+                    [2.3, 2.7],
+                    [2.0, 1.6],
+                    [1.0, 1.1],
+                    [1.5, 1.6],
+                    [1.1, 0.9],
+                ],
+            ),
+            np.array(
+                [
+                    [0.8279701862010879, 0.17511530704691558],
+                    [-1.7775803252804292, -0.14285722654428068],
+                    [0.9921974944148886, -0.3843749888804125],
+                    [0.27421041597539936, -0.13041720657412711],
+                    [1.6758014186445398, 0.20949846125675342],
+                    [0.9129491031588081, -0.17528244362036988],
+                    [-0.09910943749844434, 0.34982469809712086],
+                    [-1.1445721637986601, -0.04641725818328135],
+                    [-0.4380461367624502, -0.017764629675083188],
+                    [-1.2238205550547405, 0.16267528707676182],
+                ],
+            ),
+            np.array(
+                [
+                    [2.5, 2.4],
+                    [0.4999999999999998, 0.7],
+                    [2.2, 2.9],
+                    [1.9, 2.2],
+                    [3.1000000000000005, 3.0],
+                    [2.3, 2.7],
+                    [2.0, 1.6],
+                    [0.9999999999999999, 1.1],
+                    [1.5, 1.6],
+                    [1.0999999999999999, 0.9000000000000001],
+                ],
+            ),
+        ),
+    ],
+)
+def test_pca_inverse_transform(n_components, data, expected_transformed, expected_inverse):
+    pca = PCA(n_components)
+    transformed = pca.fit_transform(data)
+    inversed = pca.inverse_transform(transformed)
+    np.testing.assert_array_almost_equal(transformed, expected_transformed)
+    np.testing.assert_array_almost_equal(inversed, expected_inverse)
+
+
+# Helper function to create test images
+def create_reference_image(shape, dtype=np.uint8):
+    if dtype == np.uint8:
+        return np.random.randint(0, 256, shape, dtype=dtype)
+    return np.random.rand(*shape).astype(dtype)
+
+
+@pytest.mark.parametrize(
+    "img_shape, ref_shape, dtype",
+    [
+        ((100, 100, 3), (100, 100, 3), np.uint8),
+        ((100, 100, 1), (100, 100, 1), np.uint8),
+        ((50, 50, 3), (100, 100, 3), np.uint8),
+        ((100, 100, 3), (50, 50, 3), np.uint8),
+        ((100, 100, 3), (50, 50, 3), np.float32),
+    ],
+)
+def test_apply_histogram_shapes_and_types(img_shape, ref_shape, dtype):
+    img = create_reference_image(img_shape, dtype)
+    reference_image = create_reference_image(ref_shape, dtype)
+    blend_ratio = 0.5
+
+    result = apply_histogram(img, reference_image, blend_ratio)
+
+    assert result.shape == img_shape
+    assert result.dtype == dtype
+
+
+@pytest.mark.parametrize("blend_ratio", [0.0, 0.25, 0.5, 0.75, 1.0])
+def test_apply_histogram_blend_ratio(blend_ratio):
+    # Use images with deliberately different histograms to avoid flakiness
+    # (random images can have similar histograms, making blend produce ~img)
+    img = np.full((100, 100, 3), 30, dtype=np.uint8)
+    reference_image = np.full((100, 100, 3), 220, dtype=np.uint8)
+
+    result = apply_histogram(img, reference_image, blend_ratio)
+
+    if blend_ratio == 0.0:
+        np.testing.assert_array_equal(result, img)
+    elif blend_ratio == 1.0:
+        assert not np.array_equal(result, img)
+    else:
+        assert not np.array_equal(result, img)
+        assert not np.array_equal(result, reference_image)
+
+
+def test_apply_histogram_grayscale():
+    img = create_reference_image((100, 100, 1))
+    reference_image = create_reference_image((100, 100, 1))
+    blend_ratio = 0.5
+
+    result = apply_histogram(img, reference_image, blend_ratio)
+
+    assert result.shape == (100, 100, 1)
+
+
+def test_apply_histogram_multichannel():
+    img = create_reference_image((100, 100, 3))
+    reference_image = create_reference_image((100, 100, 3))
+    blend_ratio = 0.5
+
+    result = apply_histogram(img, reference_image, blend_ratio)
+
+    assert result.shape == (100, 100, 3)
+
+
+def test_apply_histogram_resize():
+    img = create_reference_image((100, 100, 3))
+    reference_image = create_reference_image((50, 50, 3))
+    blend_ratio = 0.5
+
+    result = apply_histogram(img, reference_image, blend_ratio)
+
+    assert result.shape == (100, 100, 3)
+
+
+@pytest.mark.parametrize(
+    "img_shape, ref_shape",
+    [
+        ((100, 100, 3), (100, 100, 3)),
+        ((100, 100, 1), (100, 100, 1)),
+        ((50, 50, 3), (100, 100, 3)),
+    ],
+)
+def test_apply_histogram_preserves_range(img_shape, ref_shape):
+    img = create_reference_image(img_shape)
+    reference_image = create_reference_image(ref_shape)
+    blend_ratio = 0.5
+
+    result = apply_histogram(img, reference_image, blend_ratio)
+
+    assert result.min() >= 0
+    assert result.max() <= 255
+
+
+def test_apply_histogram_float_input():
+    img = create_reference_image((100, 100, 3), dtype=np.float32)
+    reference_image = create_reference_image((100, 100, 3), dtype=np.float32)
+    blend_ratio = 0.5
+
+    result = apply_histogram(img, reference_image, blend_ratio)
+
+    assert result.dtype == np.float32
+    assert 0 <= result.min() <= result.max() <= 1
+
+
+def test_apply_histogram_different_distributions():
+    img = np.full((100, 100, 3), 50, dtype=np.uint8)
+    reference_image = np.full((100, 100, 3), 200, dtype=np.uint8)
+    blend_ratio = 1.0
+
+    result = apply_histogram(img, reference_image, blend_ratio)
+
+    assert result.mean() > img.mean()
+
+
+def test_apply_histogram_identity():
+    img = create_reference_image((100, 100, 3))
+    blend_ratio = 1.0
+
+    result = apply_histogram(img, img, blend_ratio)
+
+    np.testing.assert_array_almost_equal(result, img)
+
+
+def generate_random_image(shape, dtype=np.uint8):
+    if dtype == np.uint8:
+        return np.random.randint(0, 256, shape, dtype=dtype)
+    # Assume float32
+    return np.random.rand(*shape).astype(dtype)
+
+
+@pytest.mark.parametrize(
+    "shape, channel_axis",
+    [
+        ((100, 100, 1), -1),  # Grayscale uint8
+        ((100, 100, 3), -1),  # RGB uint8
+        ((100, 100, 4), -1),  # RGBA uint8
+    ],
+)
+def test_match_histograms(shape, channel_axis):
+    dtype = np.uint8
+    source = generate_random_image(shape, dtype)
+    reference = generate_random_image(shape, dtype)
+
+    our_result = our_match_histograms(source, reference)
+    skimage_result = skimage_match_histograms(source, reference, channel_axis=channel_axis)
+
+    assert our_result.shape == skimage_result.shape
+    assert our_result.dtype == source.dtype
+
+    # Compare histograms
+
+    for channel in range(shape[channel_axis]):
+        our_hist, _ = np.histogram(
+            np.take(our_result, channel, axis=channel_axis).ravel(),
+            bins=256,
+            range=(0, 1 if dtype == np.float32 else 255),
+        )
+        skimage_hist, _ = np.histogram(
+            np.take(skimage_result, channel, axis=channel_axis).ravel(),
+            bins=256,
+            range=(0, 1 if dtype == np.float32 else 255),
+        )
+        np.testing.assert_allclose(our_hist, skimage_hist, rtol=1e-5, atol=1)
+
+    # Compare mean and standard deviation
+    np.testing.assert_allclose(our_result.mean(), skimage_result.mean(), rtol=1e-5)
+    np.testing.assert_allclose(our_result.std(), skimage_result.std(), rtol=1e-5)
+
+    # Compare structural similarity
+    similarity = ssim(our_result, skimage_result, channel_axis=channel_axis, data_range=255)
+    assert similarity > 0.99, f"SSIM should be > 0.99, got {similarity}"
+
+    # Compare pixel-wise differences
+    max_diff = np.max(np.abs(our_result.astype(np.float64) - skimage_result.astype(np.float64)))
+    assert max_diff <= 1e-5, f"Max pixel-wise difference should be <= 1e-5, got {max_diff}"
+
+
+@pytest.mark.parametrize(
+    "shape, dtype",
+    [
+        ((100, 100, 1), np.uint8),
+        ((100, 100, 3), np.uint8),
+    ],
+)
+def test_match_histograms_identity(shape, dtype):
+    image = generate_random_image(shape, dtype)
+    result = our_match_histograms(image, image)
+    np.testing.assert_allclose(result, image, rtol=1e-5, atol=1e-8)
+
+
+def test_match_histograms_different_shapes():
+    source = generate_random_image((100, 100, 3), np.uint8)
+    reference = generate_random_image((50, 50, 3), np.uint8)
+    result = our_match_histograms(source, reference)
+    assert result.shape == source.shape
+
+
+# ── 5-channel tests ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("num_channels", [5, 6])
+def test_apply_histogram_5plus_channels(num_channels):
+    rng = np.random.default_rng(137)
+    img = rng.integers(0, 256, (100, 100, num_channels), dtype=np.uint8)
+    ref = rng.integers(0, 256, (80, 80, num_channels), dtype=np.uint8)
+    result = apply_histogram(img, ref, blend_ratio=0.5)
+    assert result.shape == img.shape
+    assert result.dtype == img.dtype
+
+
+@pytest.mark.parametrize("num_channels", [5, 6])
+@pytest.mark.parametrize("transform_type", ["pca", "standard", "minmax"])
+def test_adapt_pixel_distribution_5plus_channels(num_channels, transform_type):
+    rng = np.random.default_rng(137)
+    img = rng.integers(0, 256, (100, 100, num_channels), dtype=np.uint8)
+    ref = rng.integers(0, 256, (80, 80, num_channels), dtype=np.uint8)
+    result = adapt_pixel_distribution(img, ref, transform_type=transform_type, weight=0.5)
+    assert result.shape == img.shape
+    assert result.dtype == img.dtype
+
+
+@pytest.mark.parametrize("transform_type", ["pca", "standard", "minmax"])
+@pytest.mark.parametrize("dtype", [np.uint8, np.float16, np.float32])
+@pytest.mark.parametrize("container", ["numpy", "tensor"])
+@pytest.mark.parametrize("same_shape", [False, True])
+def test_pixel_distribution_adaptation_single_channel(transform_type, dtype, container, same_shape):
+    rng = np.random.default_rng(137)
+    image_uint8 = rng.integers(0, 256, (17, 23, 1), dtype=np.uint8)
+    reference_shape = image_uint8.shape if same_shape else (13, 19, 1)
+    reference_uint8 = rng.integers(0, 256, reference_shape, dtype=np.uint8)
+    image_half = (image_uint8.astype(np.float32) / 255).astype(np.float16)
+    reference_half = (reference_uint8.astype(np.float32) / 255).astype(np.float16)
+    image = image_uint8 if dtype == np.uint8 else image_half if dtype == np.float16 else image_half.astype(np.float32)
+    reference = (
+        reference_uint8
+        if dtype == np.uint8
+        else reference_half
+        if dtype == np.float16
+        else reference_half.astype(np.float32)
+    )
+    original = image.copy()
+    reference_before = reference.copy()
+    source = numpy_to_tensor_spatial(image.copy(), "image") if container == "tensor" else image.copy()
+    if container == "numpy":
+        source.flags.writeable = False
+
+    def make_pipeline():
+        return A.Compose(
+            [
+                A.PixelDistributionAdaptation(
+                    blend_ratio=(0.5, 0.5),
+                    transform_type=transform_type,
+                    metadata_key="pda_metadata",
+                    p=1.0,
+                ),
+            ],
+            seed=137,
+            strict=True,
+        )
+
+    result = make_pipeline()(image=source, pda_metadata=[reference])["image"]
+    actual = tensor_to_numpy_spatial(result, "image") if container == "tensor" else result
+    preserved = tensor_to_numpy_spatial(source, "image") if container == "tensor" else source
+
+    assert actual.shape == image.shape
+    assert actual.dtype == dtype
+    np.testing.assert_array_equal(preserved, original)
+    np.testing.assert_array_equal(reference, reference_before)
+    if dtype == np.float16:
+        float32_image = image.astype(np.float32)
+        float32_reference = reference.astype(np.float32)
+        float32_source = numpy_to_tensor_spatial(float32_image, "image") if container == "tensor" else float32_image
+        float32_result = make_pipeline()(image=float32_source, pda_metadata=[float32_reference])["image"]
+        if container == "tensor":
+            float32_result = tensor_to_numpy_spatial(float32_result, "image")
+        np.testing.assert_array_equal(actual, float32_result.astype(np.float16))
+
+
+@pytest.mark.parametrize("operation", ["histogram", "fda"])
+@pytest.mark.parametrize("dtype", [np.uint8, np.float16, np.float32])
+@pytest.mark.parametrize("container", ["numpy", "tensor"])
+def test_single_channel_domain_adaptation_compose(operation, dtype, container):
+    rng = np.random.default_rng(137)
+    image_uint8 = rng.integers(0, 256, (32, 40, 1), dtype=np.uint8)
+    reference_uint8 = rng.integers(0, 256, (32, 40, 1), dtype=np.uint8)
+    image_half = (image_uint8.astype(np.float32) / 255).astype(np.float16)
+    reference_half = (reference_uint8.astype(np.float32) / 255).astype(np.float16)
+    image = image_uint8 if dtype == np.uint8 else image_half if dtype == np.float16 else image_half.astype(np.float32)
+    reference = (
+        reference_uint8
+        if dtype == np.uint8
+        else reference_half
+        if dtype == np.float16
+        else reference_half.astype(np.float32)
+    )
+    original = image.copy()
+    reference_before = reference.copy()
+    source = numpy_to_tensor_spatial(image.copy(), "image") if container == "tensor" else image.copy()
+    if container == "numpy":
+        source.flags.writeable = False
+
+    if operation == "histogram":
+        key = "hm_metadata"
+        expected = apply_histogram(image, reference, 0.5)
+    else:
+        key = "fda_metadata"
+        expected = fourier_domain_adaptation(image, reference, 0.1)
+
+    def make_pipeline():
+        if operation == "histogram":
+            current_transform = A.HistogramMatching(blend_ratio=(0.5, 0.5), metadata_key=key, p=1.0)
+        else:
+            current_transform = A.FDA(beta_range=(0.1, 0.1), metadata_key=key, p=1.0)
+        return A.Compose([current_transform], seed=137, strict=True)
+
+    result = make_pipeline()(image=source, **{key: [reference]})["image"]
+    actual = tensor_to_numpy_spatial(result, "image") if container == "tensor" else result
+    preserved = tensor_to_numpy_spatial(source, "image") if container == "tensor" else source
+
+    assert actual.shape == image.shape
+    assert actual.dtype == dtype
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(preserved, original)
+    np.testing.assert_array_equal(reference, reference_before)
+    if dtype == np.float16:
+        float32_image = image.astype(np.float32)
+        float32_reference = reference.astype(np.float32)
+        float32_source = numpy_to_tensor_spatial(float32_image, "image") if container == "tensor" else float32_image
+        float32_result = make_pipeline()(image=float32_source, **{key: [float32_reference]})["image"]
+        if container == "tensor":
+            float32_result = tensor_to_numpy_spatial(float32_result, "image")
+        np.testing.assert_array_equal(actual, float32_result.astype(np.float16))
+
+
+@pytest.mark.parametrize("num_channels", [5, 6])
+def test_histogram_matching_transform_5plus_channels(num_channels):
+    rng = np.random.default_rng(137)
+    image = rng.integers(0, 256, (100, 100, num_channels), dtype=np.uint8)
+    reference = rng.integers(0, 256, (100, 100, num_channels), dtype=np.uint8)
+    transform = A.HistogramMatching(
+        blend_ratio=(0.5, 0.5),
+        metadata_key="hm_metadata",
+        p=1.0,
+    )
+    result = transform(image=image, hm_metadata=[reference])["image"]
+    assert result.shape == image.shape
+    assert result.dtype == image.dtype
+
+
+@pytest.mark.parametrize("num_channels", [5, 6])
+def test_fda_transform_5plus_channels(num_channels):
+    rng = np.random.default_rng(137)
+    image = rng.integers(0, 256, (100, 100, num_channels), dtype=np.uint8)
+    reference = rng.integers(0, 256, (120, 120, num_channels), dtype=np.uint8)
+    transform = A.FDA(
+        beta_range=(0.05, 0.05),
+        metadata_key="fda_metadata",
+        p=1.0,
+    )
+    result = transform(image=image, fda_metadata=[reference])["image"]
+    assert result.shape == image.shape
+    assert result.dtype == image.dtype
+
+
+def test_fda_materializes_reference_images_for_unaligned_aliases():
+    rng = np.random.default_rng(137)
+    image = rng.integers(0, 256, (17, 23, 3), dtype=np.uint8)
+    image2 = rng.integers(0, 256, (29, 31, 3), dtype=np.uint8)
+    reference = rng.integers(0, 256, (11, 13, 3), dtype=np.uint8)
+    transform = A.FDA(beta_range=(0.05, 0.05), p=1.0)
+    transform.add_targets({"image2": "image"})
+
+    result = transform(image=image, image2=image2, fda_metadata=[reference])
+
+    assert result["image"].shape == image.shape
+    assert result["image2"].shape == image2.shape
+
+
+def test_fda_rejects_aliases_with_channels_incompatible_with_reference():
+    rng = np.random.default_rng(137)
+    image = rng.integers(0, 256, (17, 23, 3), dtype=np.uint8)
+    image2 = rng.integers(0, 256, (17, 23, 5), dtype=np.uint8)
+    reference = rng.integers(0, 256, (11, 13, 3), dtype=np.uint8)
+    transform = A.FDA(beta_range=(0.05, 0.05), p=1.0)
+    transform.add_targets({"image2": "image"})
+
+    with pytest.raises(ValueError, match="reference image has 3 channels; target 'image2' has 5"):
+        transform(image=image, image2=image2, fda_metadata=[reference])
+
+
+@pytest.mark.parametrize("num_channels", [5, 6])
+@pytest.mark.parametrize("transform_type", ["pca", "standard", "minmax"])
+def test_pixel_distribution_adaptation_transform_5plus_channels(num_channels, transform_type):
+    rng = np.random.default_rng(137)
+    image = rng.integers(0, 256, (100, 100, num_channels), dtype=np.uint8)
+    reference = rng.integers(0, 256, (80, 80, num_channels), dtype=np.uint8)
+    transform = A.PixelDistributionAdaptation(
+        transform_type=transform_type,
+        blend_ratio=(0.5, 0.5),
+        metadata_key="pda_metadata",
+        p=1.0,
+    )
+    result = transform(image=image, pda_metadata=[reference])["image"]
+    assert result.shape == image.shape
+    assert result.dtype == image.dtype
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float16, np.float32])
+@pytest.mark.parametrize("channels", [1, 3, 5])
+@pytest.mark.parametrize("transform_type", ["pca", "standard", "minmax"])
+@pytest.mark.parametrize("container", ["numpy", "tensor"])
+def test_pixel_distribution_matching_reference_preserves_floating_signal(dtype, channels, transform_type, container):
+    rng = np.random.default_rng(137)
+    values = rng.integers(32, 224, (17, 23, channels), dtype=np.uint8)
+    image = values if dtype == np.uint8 else (values.astype(np.float32) / 255).astype(dtype)
+    original = image.copy()
+    source = numpy_to_tensor_spatial(image, "image") if container == "tensor" else image
+    pipeline = A.Compose(
+        [A.PixelDistributionAdaptation(blend_ratio=(0.5, 0.5), transform_type=transform_type, p=1)],
+        strict=True,
+        seed=137,
+    )
+
+    result = pipeline(image=source, pda_metadata=[original.copy()])["image"]
+    actual = tensor_to_numpy_spatial(result, "image") if container == "tensor" else result
+
+    np.testing.assert_allclose(actual, original, rtol=0, atol=1 if dtype == np.uint8 else 1 / 255)
+    np.testing.assert_array_equal(image, original)
+    assert actual.dtype == dtype
+
+
+@pytest.mark.parametrize("operation", ["pca", "standard", "minmax", "fda"])
+@pytest.mark.parametrize("dtype", [np.uint8, np.float16, np.float32])
+@pytest.mark.parametrize("source_channel", [False, True])
+@pytest.mark.parametrize("reference_channel", [False, True])
+@pytest.mark.parametrize("same_shape", [False, True])
+def test_direct_domain_adaptation_preserves_grayscale_channel_representation(
+    operation, dtype, source_channel, reference_channel, same_shape
+):
+    rng = np.random.default_rng(137)
+    source_bytes = rng.integers(0, 256, (11, 13), dtype=np.uint8)
+    reference_shape = source_bytes.shape if same_shape else (9, 17)
+    reference_bytes = rng.integers(0, 256, reference_shape, dtype=np.uint8)
+    source = source_bytes if dtype == np.uint8 else (source_bytes.astype(np.float32) / 255).astype(dtype)
+    reference = reference_bytes if dtype == np.uint8 else (reference_bytes.astype(np.float32) / 255).astype(dtype)
+    original = source.copy()
+    reference_before = reference.copy()
+
+    def apply(image, donor):
+        if operation == "fda":
+            return fourier_domain_adaptation(image, donor, beta=0.1)
+        return adapt_pixel_distribution(image, donor, transform_type=operation, weight=0.5)
+
+    expected = apply(source[..., None], reference[..., None])
+    actual = apply(
+        source[..., None] if source_channel else source, reference[..., None] if reference_channel else reference
+    )
+
+    np.testing.assert_array_equal(actual, expected if source_channel else expected[..., 0])
+    np.testing.assert_array_equal(source, original)
+    np.testing.assert_array_equal(reference, reference_before)
+    assert actual.dtype == dtype

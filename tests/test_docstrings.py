@@ -1,0 +1,140 @@
+"""Tests to validate that transform docstrings match their actual properties."""
+
+import re
+
+import pytest
+from albu_spec import get_transform_metadata
+from google_docstring_parser import parse_google_docstring
+
+import albumentations as A
+from albumentations.core.type_definitions import Targets
+from tests.utils import get_all_valid_transforms
+
+_TRANSFORM_BASE_CLASSES = frozenset(
+    {
+        A.BasicTransform,
+        A.DualTransform,
+        A.ImageOnlyTransform,
+        A.Transform3D,
+        A.VolumeOnlyTransform,
+    },
+)
+PUBLIC_TRANSFORM_CLASSES = tuple(
+    transform_cls
+    for transform_cls in get_all_valid_transforms()
+    if issubclass(transform_cls, A.BasicTransform) and transform_cls not in _TRANSFORM_BASE_CLASSES
+)
+_MIN_SHORT_DESCRIPTION_LENGTH = 120
+_MAX_SHORT_DESCRIPTION_LENGTH = 160
+
+
+def get_short_description(docstring: str) -> str:
+    """Return the normalized first paragraph used for transform preview metadata."""
+    return " ".join(re.split(r"\n\s*\n", docstring.strip(), maxsplit=1)[0].split())
+
+
+@pytest.mark.parametrize("transform_cls", PUBLIC_TRANSFORM_CLASSES)
+def test_public_transform_short_description_length(transform_cls):
+    """Require public transform preview metadata to fit the supported description range."""
+    short_description = get_short_description(transform_cls.__doc__ or "")
+    assert _MIN_SHORT_DESCRIPTION_LENGTH <= len(short_description) <= _MAX_SHORT_DESCRIPTION_LENGTH, (
+        f"{transform_cls.__name__}: first docstring paragraph must be "
+        f"{_MIN_SHORT_DESCRIPTION_LENGTH}-{_MAX_SHORT_DESCRIPTION_LENGTH} characters, "
+        f"got {len(short_description)}"
+    )
+
+
+def get_class_targets(cls) -> set[str]:
+    """Get targets from class _targets property as lowercase strings."""
+    raw_targets = cls._targets
+    targets = raw_targets if isinstance(raw_targets, tuple) else (raw_targets,)
+    return {target.name.lower() if isinstance(target, Targets) else target for target in targets}
+
+
+def parse_bbox_types_from_docstring(docstring_bbox_types: str | None) -> set[str]:
+    """Parse bbox types from docstring format to set of strings."""
+    if not docstring_bbox_types:
+        return set()
+
+    # Split by comma and clean up
+    bbox_types = [t.strip().lower() for t in docstring_bbox_types.split(",")]
+    return set(bbox_types)
+
+
+def get_class_bbox_types(cls) -> set[str]:
+    """Get bbox types from class _supported_bbox_types property."""
+    if not hasattr(cls, "_supported_bbox_types"):
+        return set()
+
+    bbox_types = cls._supported_bbox_types
+    if isinstance(bbox_types, frozenset):
+        return set(bbox_types)
+    if isinstance(bbox_types, set):
+        return bbox_types
+
+    return set()
+
+
+@pytest.mark.parametrize("transform_cls", PUBLIC_TRANSFORM_CLASSES)
+def test_docstring_targets_match_class_property(transform_cls):
+    """Require albu-spec to parse the documented targets exactly as declared."""
+    transform_name = transform_cls.__name__
+    docstring = transform_cls.__doc__
+
+    assert docstring, f"{transform_name} has no docstring"
+
+    target_headers = re.findall(r"^[ \t]*Targets:[ \t]*$", docstring, flags=re.MULTILINE)
+    assert len(target_headers) == 1, f"{transform_name}: require exactly one 'Targets:' section header on its own line"
+    parsed_docstring = get_transform_metadata(transform_cls).docstring_parsed
+    assert parsed_docstring is not None, f"{transform_name} has no parsed docstring"
+    parsed_targets = parsed_docstring.extra_sections.get("Targets")
+    assert parsed_targets, f"{transform_name} has no parsed 'Targets:' section"
+    docstring_targets = {name.strip().lower() for name in parsed_targets.split(",")}
+    class_targets = get_class_targets(transform_cls)
+
+    assert class_targets, f"{transform_name} has no _targets property"
+    assert docstring_targets == class_targets, (
+        f"{transform_name}: Docstring targets {docstring_targets} don't match class _targets {class_targets}"
+    )
+
+
+@pytest.mark.parametrize("transform_cls", PUBLIC_TRANSFORM_CLASSES)
+def test_docstring_bbox_types_match_class_property(transform_cls):
+    """Test that 'Supported bboxes:' in docstring matches _supported_bbox_types class property."""
+    transform_name = transform_cls.__name__
+    docstring = transform_cls.__doc__
+
+    assert docstring, f"{transform_name} has no docstring"
+
+    parsed = parse_google_docstring(docstring)
+    docstring_bbox_types_str = parsed.get("Supported bboxes")
+
+    # Parse bbox types from docstring
+    docstring_bbox_types = parse_bbox_types_from_docstring(docstring_bbox_types_str)
+
+    # Get bbox types from class property
+    class_bbox_types = get_class_bbox_types(transform_cls)
+
+    # Only check if the transform supports bboxes
+    class_targets = get_class_targets(transform_cls)
+    supports_bboxes = "bboxes" in class_targets
+
+    if supports_bboxes:
+        # If transform supports bboxes, it should have bbox types defined
+        if class_bbox_types:
+            # If class has _supported_bbox_types, docstring should document it
+            assert docstring_bbox_types, (
+                f"{transform_name} supports bboxes and has _supported_bbox_types={class_bbox_types}, "
+                f"but docstring has no 'Supported bboxes:' section"
+            )
+
+            # Check they match
+            assert docstring_bbox_types == class_bbox_types, (
+                f"{transform_name}: Docstring bbox types {docstring_bbox_types} "
+                f"don't match class _supported_bbox_types {class_bbox_types}"
+            )
+    else:
+        # If transform doesn't support bboxes, it shouldn't have bbox types in docstring
+        assert not docstring_bbox_types, (
+            f"{transform_name} doesn't support bboxes but has 'Supported bboxes: {docstring_bbox_types_str}' in docstring"
+        )

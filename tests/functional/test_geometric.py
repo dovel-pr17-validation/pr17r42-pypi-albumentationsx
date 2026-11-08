@@ -1,0 +1,999 @@
+import cv2
+import numpy as np
+import pytest
+
+from albumentations.augmentations.geometric import functional as fgeometric
+from albumentations.augmentations.geometric.functional import from_distance_maps, to_distance_maps
+from tests.utils import set_seed
+
+
+@pytest.mark.parametrize(
+    "image_shape, keypoints, inverted",
+    [
+        ((100, 100), [(50, 50), (25, 75)], False),
+        ((100, 100), [(50, 50), (25, 75)], True),
+        ((200, 300), [(100, 150), (50, 199), (150, 50)], False),
+        ((200, 300), [(100, 150), (50, 199), (150, 50)], True),
+    ],
+)
+def test_to_distance_maps(image_shape, keypoints, inverted):
+    distance_maps = to_distance_maps(keypoints, image_shape, inverted)
+
+    assert distance_maps.shape == (*image_shape, len(keypoints))
+    assert distance_maps.dtype == np.float32
+
+    for i, (x, y) in enumerate(keypoints):
+        if inverted:
+            assert np.isclose(distance_maps[int(y), int(x), i], 1.0)
+        else:
+            assert np.isclose(distance_maps[int(y), int(x), i], 0.0)
+
+    if inverted:
+        assert np.all(distance_maps > 0) and np.all(distance_maps <= 1)
+    else:
+        assert np.all(distance_maps >= 0)
+
+
+@pytest.mark.parametrize(
+    "image_shape, keypoints, inverted, threshold, if_not_found_coords",
+    [
+        ((100, 100), [(50, 50), (25, 75)], False, None, None),
+        ((100, 100), [(50, 50), (25, 75)], True, None, None),
+        ((200, 300), [(100, 150), (50, 199), (150, 50)], False, 10, None),
+        ((200, 300), [(100, 150), (50, 199), (150, 50)], True, 0.5, [0, 0]),
+        ((150, 150), [(75, 75), (25, 125), (125, 25)], False, None, {"x": -1, "y": -1}),
+    ],
+)
+def test_from_distance_maps(
+    image_shape,
+    keypoints,
+    inverted,
+    threshold,
+    if_not_found_coords,
+):
+    distance_maps = to_distance_maps(keypoints, image_shape, inverted)
+    recovered_keypoints = from_distance_maps(
+        distance_maps,
+        inverted,
+        if_not_found_coords,
+        threshold,
+    )
+
+    assert len(recovered_keypoints) == len(keypoints)
+
+    for original, recovered in zip(keypoints, recovered_keypoints, strict=False):
+        if threshold is None:
+            np.testing.assert_allclose(original, recovered, atol=1)
+        else:
+            x, y = original
+            i = keypoints.index(original)
+            if (inverted and distance_maps[int(y), int(x), i] >= threshold) or (
+                not inverted and distance_maps[int(y), int(x), i] <= threshold
+            ):
+                np.testing.assert_allclose(original, recovered, atol=1)
+            elif if_not_found_coords is not None:
+                if isinstance(if_not_found_coords, dict):
+                    np.testing.assert_allclose(
+                        recovered,
+                        [if_not_found_coords["x"], if_not_found_coords["y"]],
+                        rtol=1e-5,
+                        atol=1e-8,
+                        equal_nan=False,
+                    )
+                else:
+                    np.testing.assert_allclose(recovered, if_not_found_coords, rtol=1e-5, atol=1e-8, equal_nan=False)
+            else:
+                np.testing.assert_allclose(original, recovered, atol=1)
+
+
+@pytest.mark.parametrize(
+    "image_shape, keypoints, inverted",
+    [
+        ((100, 100), [(50, 50), (25, 75)], False),
+        ((200, 300), [(100, 150), (50, 199), (150, 50)], True),
+    ],
+)
+def test_to_distance_maps_extra_columns(image_shape, keypoints, inverted):
+    keypoints_with_extra = [(x, y, 0, 1) for x, y in keypoints]
+    distance_maps = to_distance_maps(keypoints_with_extra, image_shape, inverted)
+
+    assert distance_maps.shape == (*image_shape, len(keypoints))
+    assert distance_maps.dtype == np.float32
+
+    for i, (x, y, _, _) in enumerate(keypoints_with_extra):
+        if inverted:
+            assert np.isclose(distance_maps[int(y), int(x), i], 1.0)
+        else:
+            assert np.isclose(distance_maps[int(y), int(x), i], 0.0)
+
+
+@pytest.mark.parametrize("inverted", [False, True])
+def test_to_distance_maps_many_keypoints_matches_float32_reference(inverted: bool) -> None:
+    height, width = 24, 32
+    keypoints = (
+        np.random.default_rng(137)
+        .uniform(
+            [0, 0, 0, 0],
+            [width - 1, height - 1, 2 * np.pi, 1],
+            size=(33, 4),
+        )
+        .astype(np.float32)
+    )
+
+    distance_maps = to_distance_maps(keypoints, (height, width), inverted)
+
+    y_coordinates, x_coordinates = np.mgrid[:height, :width]
+    expected = np.sqrt(
+        (x_coordinates[..., np.newaxis] - keypoints[:, 0]) ** 2
+        + (y_coordinates[..., np.newaxis] - keypoints[:, 1]) ** 2,
+    ).astype(np.float32)
+    if inverted:
+        expected = (1 / (expected + 1)).astype(np.float32)
+
+    assert distance_maps.shape == (height, width, len(keypoints))
+    assert distance_maps.dtype == np.float32
+    np.testing.assert_allclose(distance_maps, expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(("image_shape", "k"), [((24, 32), -0.2), ((33, 25), 0.3)])
+def test_fisheye_distortion_maps_match_radial_model(image_shape: tuple[int, int], k: float) -> None:
+    height, width = image_shape
+    center_x, center_y = width / 2, height / 2
+    y_coordinates, x_coordinates = np.mgrid[:height, :width].astype(np.float32)
+    x_coordinates -= center_x
+    y_coordinates -= center_y
+    radius = np.sqrt(x_coordinates * x_coordinates + y_coordinates * y_coordinates)
+    max_radius = np.hypot(
+        max(center_x, width - center_x),
+        max(center_y, height - center_y),
+    )
+    distorted_radius = radius * (1 + k * (radius / max_radius) ** 2)
+    angle = np.arctan2(y_coordinates, x_coordinates)
+    expected_x = distorted_radius * np.cos(angle) + center_x
+    expected_y = distorted_radius * np.sin(angle) + center_y
+
+    map_x, map_y = fgeometric.get_fisheye_distortion_maps(image_shape, k)
+
+    assert map_x.dtype == np.float32
+    assert map_y.dtype == np.float32
+    np.testing.assert_allclose(map_x, expected_x, rtol=1e-6, atol=1e-5)
+    np.testing.assert_allclose(map_y, expected_y, rtol=1e-6, atol=1e-5)
+
+
+@pytest.mark.parametrize("num_control_points", [2, 3, 4, 5])
+def test_tps_interpolates_control_points(num_control_points: int) -> None:
+    src_points = fgeometric.generate_control_points(num_control_points)
+    dst_points = src_points + np.random.default_rng(137).uniform(
+        -0.08,
+        0.08,
+        size=src_points.shape,
+    ).astype(np.float32)
+
+    nonlinear_weights, affine_weights = fgeometric.compute_tps_weights(src_points, dst_points)
+    transformed_points = fgeometric.tps_transform(
+        src_points,
+        src_points,
+        nonlinear_weights,
+        affine_weights,
+    )
+
+    assert transformed_points.dtype == np.float32
+    np.testing.assert_allclose(transformed_points, dst_points, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+def test_tps_transform_dense_map_emits_no_runtime_warnings() -> None:
+    src_points = fgeometric.generate_control_points(4)
+    dst_points = src_points + np.random.default_rng(137).uniform(
+        -0.08,
+        0.08,
+        size=src_points.shape,
+    ).astype(np.float32)
+    nonlinear_weights, affine_weights = fgeometric.compute_tps_weights(src_points, dst_points)
+    axis = np.linspace(0, 1, 64, dtype=np.float32)
+    target_points = np.stack(np.meshgrid(axis, axis), axis=-1).reshape(-1, 2)
+
+    transformed_points = fgeometric.tps_transform(
+        target_points,
+        src_points,
+        nonlinear_weights,
+        affine_weights,
+    )
+
+    assert transformed_points.shape == target_points.shape
+    assert transformed_points.dtype == np.float32
+    assert np.isfinite(transformed_points).all()
+
+
+@pytest.mark.parametrize(
+    "image_shape, grid, expected",
+    [
+        # Normal case: standard grids
+        (
+            (100, 200),
+            (2, 2),
+            np.array(
+                [
+                    [0, 0, 50, 100],
+                    [0, 100, 50, 200],
+                    [50, 0, 100, 100],
+                    [50, 100, 100, 200],
+                ],
+            ),
+        ),
+        # Single row grid
+        (
+            (100, 200),
+            (1, 4),
+            np.array(
+                [
+                    [0, 0, 100, 50],
+                    [0, 50, 100, 100],
+                    [0, 100, 100, 150],
+                    [0, 150, 100, 200],
+                ],
+            ),
+        ),
+        # Single column grid
+        (
+            (100, 200),
+            (4, 1),
+            np.array(
+                [[0, 0, 25, 200], [25, 0, 50, 200], [50, 0, 75, 200], [75, 0, 100, 200]],
+            ),
+        ),
+        # Edge case: Grid size equals image size
+        (
+            (100, 200),
+            (100, 200),
+            np.array([[i, j, i + 1, j + 1] for i in range(100) for j in range(200)]),
+        ),
+        # Edge case: Image where width is much larger than height
+        (
+            (10, 1000),
+            (1, 10),
+            np.array([[0, i * 100, 10, (i + 1) * 100] for i in range(10)]),
+        ),
+        # Edge case: Image where height is much larger than width
+        (
+            (1000, 10),
+            (10, 1),
+            np.array([[i * 100, 0, (i + 1) * 100, 10] for i in range(10)]),
+        ),
+        # Corner case: height and width are not divisible by the number of splits
+        (
+            (105, 205),
+            (3, 4),
+            np.array(
+                [
+                    [0, 0, 35, 51],
+                    [0, 51, 35, 103],
+                    [0, 103, 35, 154],
+                    [0, 154, 35, 205],
+                    [35, 0, 70, 51],
+                    [35, 51, 70, 103],
+                    [35, 103, 70, 154],
+                    [35, 154, 70, 205],
+                    [70, 0, 105, 51],
+                    [70, 51, 105, 103],
+                    [70, 103, 105, 154],
+                    [70, 154, 105, 205],
+                ],
+            ),
+        ),
+    ],
+)
+def test_split_uniform_grid(image_shape, grid, expected):
+    random_seed = 42
+    result = fgeometric.split_uniform_grid(
+        image_shape,
+        grid,
+        random_generator=np.random.default_rng(random_seed),
+    )
+    np.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "size, divisions, random_seed, expected",
+    [
+        (10, 2, None, [0, 5, 10]),
+        (10, 2, 42, [0, 5, 10]),  # Consistent shuffling with seed
+        (9, 3, None, [0, 3, 6, 9]),
+        (9, 3, 42, [0, 3, 6, 9]),  # Expected shuffle result with a specific seed
+        (20, 5, 42, [0, 4, 8, 12, 16, 20]),  # Regular intervals
+        (7, 3, 42, [0, 2, 4, 7]),  # Irregular intervals, specific seed
+        (7, 3, 41, [0, 3, 5, 7]),  # Irregular intervals, specific seed
+    ],
+)
+def test_generate_shuffled_splits(size, divisions, random_seed, expected):
+    result = fgeometric.generate_shuffled_splits(
+        size,
+        divisions,
+        random_generator=np.random.default_rng(random_seed),
+    )
+    assert len(result) == divisions + 1
+    (
+        np.testing.assert_array_equal(
+            result,
+            expected,
+        ),
+        f"Failed for size={size}, divisions={divisions}, random_seed={random_seed}",
+    )
+
+
+@pytest.mark.parametrize(
+    "size, divisions, random_seed",
+    [
+        (10, 2, 42),
+        (9, 3, 99),
+        (20, 5, 101),
+        (7, 3, 42),
+    ],
+)
+def test_consistent_shuffling(size, divisions, random_seed):
+    set_seed(random_seed)
+    result1 = fgeometric.generate_shuffled_splits(
+        size,
+        divisions,
+        random_generator=np.random.default_rng(random_seed),
+    )
+    assert len(result1) == divisions + 1
+    set_seed(random_seed)
+    result2 = fgeometric.generate_shuffled_splits(
+        size,
+        divisions,
+        random_generator=np.random.default_rng(random_seed),
+    )
+    assert len(result2) == divisions + 1
+    (
+        np.testing.assert_array_equal(result1, result2),
+        "Shuffling is not consistent with the given random state",
+    )
+
+
+@pytest.mark.parametrize(
+    ["image_shape", "grid", "scale", "absolute_scale", "expected_shape"],
+    [
+        # Basic test cases
+        ((100, 100), (4, 4), 0.05, False, ((100, 100), (100, 100))),
+        ((200, 100), (3, 5), 0.03, False, ((200, 100), (200, 100))),
+        # Test different image shapes
+        ((50, 75), (2, 2), 0.05, False, ((50, 75), (50, 75))),
+        ((300, 200), (5, 5), 0.05, False, ((300, 200), (300, 200))),
+        # Test different grid sizes
+        ((100, 100), (2, 3), 0.05, False, ((100, 100), (100, 100))),
+        ((100, 100), (6, 6), 0.05, False, ((100, 100), (100, 100))),
+        # Test with absolute scale
+        ((100, 100), (4, 4), 5.0, True, ((100, 100), (100, 100))),
+        ((200, 200), (3, 3), 10.0, True, ((200, 200), (200, 200))),
+    ],
+)
+def test_create_piecewise_affine_maps_shapes(
+    image_shape: tuple[int, int],
+    grid: tuple[int, int],
+    scale: float,
+    absolute_scale: bool,
+    expected_shape: tuple[tuple[int, int], tuple[int, int]],
+):
+    """Test that output maps have correct shapes and types."""
+    generator = np.random.default_rng(42)
+    map_x, map_y = fgeometric.create_piecewise_affine_maps(
+        image_shape,
+        grid,
+        scale,
+        absolute_scale,
+        generator,
+    )
+
+    assert map_x is not None and map_y is not None
+    assert map_x.shape == expected_shape[0]
+    assert map_y.shape == expected_shape[1]
+    assert map_x.dtype == np.float32
+    assert map_y.dtype == np.float32
+
+
+@pytest.mark.parametrize(
+    ["image_shape", "grid", "scale"],
+    [
+        ((100, 100), (4, 4), 0.05),
+        ((200, 100), (3, 5), 0.03),
+    ],
+)
+def test_create_piecewise_affine_maps_bounds(
+    image_shape: tuple[int, int],
+    grid: tuple[int, int],
+    scale: float,
+):
+    """Test that output maps stay within image bounds."""
+    generator = np.random.default_rng(42)
+    map_x, map_y = fgeometric.create_piecewise_affine_maps(
+        image_shape,
+        grid,
+        scale,
+        False,
+        generator,
+    )
+
+    assert map_x is not None and map_y is not None
+    height, width = image_shape
+
+    assert np.all(map_x >= 0)
+    assert np.all(map_x <= width - 1)
+    assert np.all(map_y >= 0)
+    assert np.all(map_y <= height - 1)
+
+
+@pytest.mark.parametrize(
+    ["scale", "expected_result"],
+    [
+        (0.0, (None, None)),  # Zero scale should return None
+        (-1.0, (None, None)),  # Negative scale should return None
+    ],
+)
+def test_create_piecewise_affine_maps_edge_cases(
+    scale: float,
+    expected_result: tuple[None, None],
+):
+    """Test edge cases with zero or negative scale."""
+    generator = np.random.default_rng(42)
+    result = fgeometric.create_piecewise_affine_maps(
+        (100, 100),
+        (4, 4),
+        scale,
+        False,
+        generator,
+    )
+    assert result == expected_result
+
+
+def test_create_piecewise_affine_maps_reproducibility():
+    """Test that the function produces the same output with the same random seed."""
+    result1 = fgeometric.create_piecewise_affine_maps(
+        (100, 100),
+        (4, 4),
+        0.05,
+        False,
+        random_generator=np.random.default_rng(42),
+    )
+    result2 = fgeometric.create_piecewise_affine_maps(
+        (100, 100),
+        (4, 4),
+        0.05,
+        False,
+        random_generator=np.random.default_rng(42),
+    )
+
+    assert result1[0] is not None and result1[1] is not None
+    assert result2[0] is not None and result2[1] is not None
+    np.testing.assert_array_almost_equal(result1[0], result2[0])
+    np.testing.assert_array_almost_equal(result1[1], result2[1])
+
+
+# Golden fingerprint for create_piecewise_affine_maps (seed=137, (64,64), (4,4), 0.05, False).
+# Any optimization (e.g. vectorized IDW) must reproduce these to preserve qualitative behavior.
+_PIECEWISE_AFFINE_GOLDEN = {
+    "map_x_at_0_0": 1.988969e-09,
+    "map_x_at_32_32": 31.595943,
+    "map_x_at_63_63": 61.986984,
+    "map_y_at_0_0": 1.9218556e-09,
+    "map_y_at_32_32": 31.684547,
+    "map_y_at_63_63": 63.0,
+    "mean_map_x": 31.224098,
+    "mean_map_y": 31.166132,
+}
+
+
+def test_create_piecewise_affine_maps_golden_fingerprint():
+    """Lock exact numeric behavior for one fixed config; future vectorization must match this."""
+    rng = np.random.default_rng(137)
+    map_x, map_y = fgeometric.create_piecewise_affine_maps(
+        (64, 64),
+        (4, 4),
+        0.05,
+        False,
+        rng,
+    )
+    assert map_x is not None and map_y is not None
+    np.testing.assert_allclose(
+        map_x[0, 0],
+        _PIECEWISE_AFFINE_GOLDEN["map_x_at_0_0"],
+        rtol=0,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        map_x[32, 32],
+        _PIECEWISE_AFFINE_GOLDEN["map_x_at_32_32"],
+        rtol=0,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        map_x[63, 63],
+        _PIECEWISE_AFFINE_GOLDEN["map_x_at_63_63"],
+        rtol=0,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        map_y[0, 0],
+        _PIECEWISE_AFFINE_GOLDEN["map_y_at_0_0"],
+        rtol=0,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        map_y[32, 32],
+        _PIECEWISE_AFFINE_GOLDEN["map_y_at_32_32"],
+        rtol=0,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        map_y[63, 63],
+        _PIECEWISE_AFFINE_GOLDEN["map_y_at_63_63"],
+        rtol=0,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.mean(map_x),
+        _PIECEWISE_AFFINE_GOLDEN["mean_map_x"],
+        rtol=0,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.mean(map_y),
+        _PIECEWISE_AFFINE_GOLDEN["mean_map_y"],
+        rtol=0,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    "seed",
+    [0, 42, 137, 999],
+)
+def test_create_piecewise_affine_maps_determinism_seeds(seed):
+    """Same seed must yield identical maps (required for reproducible pipelines)."""
+    rng = np.random.default_rng(seed)
+    map_x1, map_y1 = fgeometric.create_piecewise_affine_maps(
+        (50, 50),
+        (4, 4),
+        0.05,
+        False,
+        rng,
+    )
+    rng2 = np.random.default_rng(seed)
+    map_x2, map_y2 = fgeometric.create_piecewise_affine_maps(
+        (50, 50),
+        (4, 4),
+        0.05,
+        False,
+        rng2,
+    )
+    np.testing.assert_array_equal(map_x1, map_x2)
+    np.testing.assert_array_equal(map_y1, map_y2)
+
+
+def test_create_piecewise_affine_maps_different_seeds_different_maps():
+    """Different seeds must produce different maps (sanity check for randomness)."""
+    mx1, my1 = fgeometric.create_piecewise_affine_maps(
+        (32, 32),
+        (3, 3),
+        0.08,
+        False,
+        np.random.default_rng(1),
+    )
+    mx2, my2 = fgeometric.create_piecewise_affine_maps(
+        (32, 32),
+        (3, 3),
+        0.08,
+        False,
+        np.random.default_rng(2),
+    )
+    assert not np.array_equal(mx1, mx2) or not np.array_equal(my1, my2)
+
+
+def test_create_piecewise_affine_maps_smaller_scale_smaller_deviation():
+    """Smaller scale should produce maps closer to identity than larger scale."""
+    height, width = 40, 40
+    xx = np.arange(width, dtype=np.float32)
+    yy = np.arange(height, dtype=np.float32)
+    identity_x = np.broadcast_to(xx, (height, width))
+    identity_y = np.broadcast_to(yy[:, np.newaxis], (height, width))
+
+    rng_small = np.random.default_rng(137)
+    map_x_small, map_y_small = fgeometric.create_piecewise_affine_maps(
+        (height, width),
+        (4, 4),
+        1e-5,
+        False,
+        rng_small,
+    )
+    rng_large = np.random.default_rng(137)
+    map_x_large, map_y_large = fgeometric.create_piecewise_affine_maps(
+        (height, width),
+        (4, 4),
+        0.1,
+        False,
+        rng_large,
+    )
+
+    dev_small = np.mean(np.abs(map_x_small - identity_x)) + np.mean(np.abs(map_y_small - identity_y))
+    dev_large = np.mean(np.abs(map_x_large - identity_x)) + np.mean(np.abs(map_y_large - identity_y))
+    assert dev_small < dev_large
+
+
+@pytest.mark.parametrize(
+    ["image_shape", "grid"],
+    [
+        ((0, 100), (4, 4)),  # Zero height
+        ((100, 0), (4, 4)),  # Zero width
+        ((100, 100), (0, 4)),  # Zero grid rows
+        ((100, 100), (4, 0)),  # Zero grid columns
+    ],
+)
+def test_create_piecewise_affine_maps_zero_dimensions(
+    image_shape: tuple[int, int],
+    grid: tuple[int, int],
+):
+    """Test handling of zero dimensions."""
+    generator = np.random.default_rng(42)
+    with pytest.raises(ValueError):
+        fgeometric.create_piecewise_affine_maps(
+            image_shape,
+            grid,
+            0.05,
+            False,
+            generator,
+        )
+
+
+@pytest.mark.parametrize(
+    ["image_shape", "grid", "scale", "absolute_scale"],
+    [
+        ((100, 100), (4, 4), 0.05, False),
+        ((200, 100), (3, 5), 0.03, True),
+    ],
+)
+def test_create_piecewise_affine_maps_grid_points(
+    image_shape: tuple[int, int],
+    grid: tuple[int, int],
+    scale: float,
+    absolute_scale: bool,
+):
+    """Test that grid points are properly distributed."""
+    generator = np.random.default_rng(42)
+    map_x, map_y = fgeometric.create_piecewise_affine_maps(
+        image_shape,
+        grid,
+        scale,
+        absolute_scale,
+        generator,
+    )
+
+    assert map_x is not None and map_y is not None
+
+    height, width = image_shape
+    nb_rows, nb_cols = grid
+
+    # Sample points should roughly correspond to grid intersections
+    y_steps = np.linspace(0, height - 1, nb_rows)
+    x_steps = np.linspace(0, width - 1, nb_cols)
+
+    # Check that grid points are present in the maps
+    for y in y_steps:
+        for x in x_steps:
+            y_idx = int(y)
+            x_idx = int(x)
+
+            # Calculate neighborhood size based on scale
+            if absolute_scale:
+                radius = int(scale * 3)  # 3 sigma radius
+            else:
+                radius = int(min(width, height) * scale * 3)
+            radius = max(1, min(radius, 5))  # Keep radius reasonable
+
+            # Get valid slice bounds
+            y_start = max(0, y_idx - radius)
+            y_end = min(height, y_idx + radius + 1)
+            x_start = max(0, x_idx - radius)
+            x_end = min(width, x_idx + radius + 1)
+
+            # Extract neighborhood
+            neighborhood = map_x[y_start:y_end, x_start:x_end]
+
+            # Calculate maximum allowed deviation
+            if absolute_scale:
+                max_deviation = scale * 3
+            else:
+                max_deviation = min(width, height) * scale * 3
+
+            # Check if any point in neighborhood is close to expected x coordinate
+            assert np.any(
+                np.abs(neighborhood - x) < max_deviation,
+            ), f"No points near grid intersection ({x}, {y}) within allowed deviation"
+
+
+def test_pad_with_params_zero_channels():
+    """Test that padding works correctly with 0-channel images."""
+    img = np.zeros((10, 10, 0), dtype=np.uint8)
+
+    result = fgeometric.pad_with_params(
+        img=img,
+        h_pad_top=2,
+        h_pad_bottom=3,
+        w_pad_left=4,
+        w_pad_right=5,
+        border_mode=cv2.BORDER_CONSTANT,
+        value=0,
+    )
+
+    assert result.shape == (15, 19, 0)  # 10+2+3, 10+4+5, 0
+    assert result.dtype == np.uint8
+    assert result.size == 0
+
+
+def test_geometry_functionals_keep_explicit_grayscale_channel() -> None:
+    height, width = 9, 13
+    image = np.random.default_rng(137).random((height, width, 1), dtype=np.float32)
+    identity = np.eye(3, dtype=np.float32)
+    mesh = np.array(
+        [[0, 0, width - 1, height - 1, 0, 0, width - 1, 0, width - 1, height - 1, 0, height - 1]],
+        dtype=np.float32,
+    )
+
+    results = (
+        fgeometric.scale(image, 1.0, cv2.INTER_NEAREST),
+        fgeometric.scale_xy(image, 1.5, 0.5, cv2.INTER_NEAREST),
+        fgeometric.perspective(image, identity, width, height, 0, cv2.BORDER_CONSTANT, True, cv2.INTER_NEAREST),
+        fgeometric.pad(image, height + 2, width + 4, cv2.BORDER_CONSTANT, 0),
+        fgeometric.pad_with_params(image, 1, 2, 3, 4, cv2.BORDER_CONSTANT, 0),
+        fgeometric.distort_image(image, mesh, cv2.INTER_NEAREST),
+    )
+    expected_shapes = (
+        (height, width, 1),
+        (4, 19, 1),
+        (height, width, 1),
+        (height + 2, width + 4, 1),
+        (height + 3, width + 7, 1),
+        (height, width, 1),
+    )
+
+    assert tuple(result.shape for result in results) == expected_shapes
+    assert all(result.dtype == image.dtype for result in results)
+
+
+class TestPiecewiseAffineNumericalAccuracy:
+    """Verify vectorized IDW interpolation matches reference per-pixel computation."""
+
+    @staticmethod
+    def _reference_piecewise_affine_maps(
+        image_shape: tuple[int, int],
+        grid: tuple[int, int],
+        scale: float,
+        absolute_scale: bool,
+        random_generator: np.random.Generator,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Pure-Python reference implementation (per-pixel loop)."""
+        height, width = image_shape
+        nb_rows, nb_cols = grid
+
+        if scale <= 0:
+            return None, None
+
+        y = np.linspace(0, height - 1, nb_rows, dtype=np.float32)
+        x = np.linspace(0, width - 1, nb_cols, dtype=np.float32)
+        xx_src, yy_src = np.meshgrid(x, y)
+
+        jitter_scale = scale / 3 if absolute_scale else scale * min(width, height) / 3
+        jitter = random_generator.normal(0, jitter_scale, (nb_rows, nb_cols, 2)).astype(np.float32)
+
+        control_points = np.zeros((nb_rows * nb_cols, 4), dtype=np.float32)
+        for i in range(nb_rows):
+            for j in range(nb_cols):
+                idx = i * nb_cols + j
+                control_points[idx, 0] = xx_src[i, j]
+                control_points[idx, 1] = yy_src[i, j]
+                control_points[idx, 2] = np.clip(xx_src[i, j] + jitter[i, j, 1], 0, width - 1)
+                control_points[idx, 3] = np.clip(yy_src[i, j] + jitter[i, j, 0], 0, height - 1)
+
+        map_x = np.zeros((height, width), dtype=np.float32)
+        map_y = np.zeros((height, width), dtype=np.float32)
+
+        for i in range(height):
+            for j in range(width):
+                dx = j - control_points[:, 0]
+                dy = i - control_points[:, 1]
+                dist = dx * dx + dy * dy
+                weights = 1 / (dist + 1e-8)
+                weights = weights / np.sum(weights)
+                map_x[i, j] = np.sum(weights * control_points[:, 2])
+                map_y[i, j] = np.sum(weights * control_points[:, 3])
+
+        np.clip(map_x, 0, width - 1, out=map_x)
+        np.clip(map_y, 0, height - 1, out=map_y)
+        return map_x, map_y
+
+    @pytest.mark.parametrize(
+        ["image_shape", "grid", "scale", "absolute_scale"],
+        [
+            ((64, 64), (4, 4), 0.05, False),
+            ((48, 80), (3, 5), 0.03, False),
+            ((32, 32), (2, 2), 0.1, False),
+            ((64, 64), (4, 4), 1.5, True),
+        ],
+    )
+    def test_maps_match_reference(self, image_shape, grid, scale, absolute_scale):
+        """Implementation must match per-pixel reference within float32 tolerance."""
+        ref_mx, ref_my = self._reference_piecewise_affine_maps(
+            image_shape,
+            grid,
+            scale,
+            absolute_scale,
+            np.random.default_rng(137),
+        )
+        mx, my = fgeometric.create_piecewise_affine_maps(
+            image_shape,
+            grid,
+            scale,
+            absolute_scale,
+            np.random.default_rng(137),
+        )
+        np.testing.assert_allclose(mx, ref_mx, rtol=0, atol=3e-5)
+        np.testing.assert_allclose(my, ref_my, rtol=0, atol=3e-5)
+
+    @pytest.mark.parametrize("scale", [0.0, -0.01])
+    def test_nonpositive_scale_returns_none(self, scale):
+        """Non-positive scale must return (None, None) in both implementations."""
+        ref = self._reference_piecewise_affine_maps(
+            (32, 32),
+            (4, 4),
+            scale,
+            False,
+            np.random.default_rng(137),
+        )
+        vec = fgeometric.create_piecewise_affine_maps(
+            (32, 32),
+            (4, 4),
+            scale,
+            False,
+            np.random.default_rng(137),
+        )
+        assert ref == (None, None)
+        assert vec == (None, None)
+
+    def test_remapped_images_match(self):
+        """End-to-end: remap with implementation maps must match reference within 1 pixel."""
+        img = np.random.default_rng(137).integers(0, 256, (64, 64, 3), dtype=np.uint8)
+
+        ref_mx, ref_my = self._reference_piecewise_affine_maps(
+            (64, 64),
+            (4, 4),
+            0.05,
+            False,
+            np.random.default_rng(42),
+        )
+        mx, my = fgeometric.create_piecewise_affine_maps(
+            (64, 64),
+            (4, 4),
+            0.05,
+            False,
+            np.random.default_rng(42),
+        )
+
+        ref_out = cv2.remap(img, ref_mx, ref_my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        out = cv2.remap(img, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+
+        diff = np.abs(ref_out.astype(np.int16) - out.astype(np.int16))
+        assert diff.max() <= 1, f"Max pixel diff {diff.max()} exceeds 1"
+        assert diff.mean() < 0.01, f"Mean pixel diff {diff.mean():4f} exceeds 0.01"
+
+
+class TestGenerateInverseDistortionMap:
+    """Verify vectorized inverse distortion map properties."""
+
+    def test_inverse_map_shapes_and_dtypes(self):
+        rng = np.random.default_rng(137)
+        h, w = 32, 32
+        map_x = rng.uniform(0, w - 1, (h, w)).astype(np.float32)
+        map_y = rng.uniform(0, h - 1, (h, w)).astype(np.float32)
+
+        inv_mx, inv_my = fgeometric.generate_inverse_distortion_map(map_x, map_y, (h, w))
+
+        assert inv_mx.shape == (h, w)
+        assert inv_my.shape == (h, w)
+        assert inv_mx.dtype == np.float32
+        assert inv_my.dtype == np.float32
+
+    def test_inverse_map_approximate_inversion(self):
+        """Forward then inverse should approximately recover identity for smooth maps."""
+        h, w = 64, 64
+        yy, xx = np.mgrid[:h, :w]
+        map_x = (xx + 2 * np.sin(yy * 0.1)).astype(np.float32)
+        map_y = (yy + 2 * np.cos(xx * 0.1)).astype(np.float32)
+        np.clip(map_x, 0, w - 1, out=map_x)
+        np.clip(map_y, 0, h - 1, out=map_y)
+
+        inv_mx, inv_my = fgeometric.generate_inverse_distortion_map(map_x, map_y, (h, w))
+
+        interior = (inv_mx > 0) | (inv_my > 0)
+        assert interior.sum() > h * w * 0.5, "Inverse map should fill most of the image"
+
+        dst_x = np.clip(np.round(map_x).astype(np.int32), 0, w - 1)
+        dst_y = np.clip(np.round(map_y).astype(np.int32), 0, h - 1)
+        valid = interior[dst_y, dst_x]
+        assert valid.sum() > h * w * 0.25, "Too few valid round-trip samples"
+
+        src_x = xx[valid].astype(np.float32)
+        src_y = yy[valid].astype(np.float32)
+        rec_x = inv_mx[dst_y[valid], dst_x[valid]]
+        rec_y = inv_my[dst_y[valid], dst_x[valid]]
+
+        max_err = max(np.abs(rec_x - src_x).max(), np.abs(rec_y - src_y).max())
+        assert max_err < 3.0, f"Round-trip max error too large: {max_err}"
+
+    def test_closest_source_wins_on_collision(self):
+        """When two source pixels map to the same destination cell, the closer one should win."""
+        # Use identity map so every pixel maps to itself,
+        # then override two source pixels to both target destination (5, 5).
+        # Source (4,4) -> dst (5.1, 5.1): floor (5,5), dist=0.1+0.1=0.2  (closer)
+        # Source (4,6) -> dst (5.4, 5.4): floor (5,5), dist=0.4+0.4=0.8
+        h, w = 16, 16
+        yy, xx = np.mgrid[:h, :w]
+        map_x = xx.astype(np.float32)
+        map_y = yy.astype(np.float32)
+
+        map_x[4, 4] = 5.1
+        map_y[4, 4] = 5.1
+        map_x[4, 6] = 5.4
+        map_y[4, 6] = 5.4
+
+        inv_mx, inv_my = fgeometric.generate_inverse_distortion_map(map_x, map_y, (h, w))
+
+        # Destination (row=5, col=5) should map back to source col=4, row=4 (the closer source)
+        assert inv_mx[5, 5] == pytest.approx(4.0, abs=1.0)
+        assert inv_my[5, 5] == pytest.approx(4.0, abs=1.0)
+
+    def test_identity_map_produces_identity_inverse(self):
+        """Identity forward map should produce near-identity inverse."""
+        h, w = 32, 32
+        yy, xx = np.mgrid[:h, :w]
+        map_x = xx.astype(np.float32)
+        map_y = yy.astype(np.float32)
+
+        inv_mx, inv_my = fgeometric.generate_inverse_distortion_map(map_x, map_y, (h, w))
+
+        np.testing.assert_allclose(inv_mx, map_x, atol=1.0)
+        np.testing.assert_allclose(inv_my, map_y, atol=1.0)
+
+
+class TestPerspectiveBboxesVectorized:
+    """Verify vectorized HBB min/max produces same results as per-box loop."""
+
+    def test_perspective_bboxes_correctness(self):
+        """Column-stack min/max must match per-box list comprehension."""
+        rng = np.random.default_rng(137)
+        points = rng.uniform(0, 1, (10, 4, 2)).astype(np.float32)
+
+        ref = np.array(
+            [[np.min(box[:, 0]), np.min(box[:, 1]), np.max(box[:, 0]), np.max(box[:, 1])] for box in points],
+        )
+        vec = np.column_stack(
+            [
+                points[:, :, 0].min(axis=1),
+                points[:, :, 1].min(axis=1),
+                points[:, :, 0].max(axis=1),
+                points[:, :, 1].max(axis=1),
+            ],
+        )
+        np.testing.assert_array_equal(vec, ref)
+
+
+class TestComputeAffineWarpOutputShape:
+    """Verify simplified output shape computation matches np.ceil-based version."""
+
+    @pytest.mark.parametrize("input_shape", [(100, 200, 3), (100, 200)])
+    def test_output_shape_types(self, input_shape):
+        matrix = np.eye(3)
+        _, shape = fgeometric.compute_affine_warp_output_shape(matrix, input_shape)
+        assert all(isinstance(v, int) for v in shape)
+        if len(input_shape) == 3:
+            assert len(shape) == 3
+        else:
+            assert len(shape) == 2

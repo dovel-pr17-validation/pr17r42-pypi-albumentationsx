@@ -1,0 +1,134 @@
+name: Security
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  # The path-scoped advanced CodeQL workflows are separate so this scheduled
+  # evidence workflow remains focused on dependency and workflow audits.
+  dependency_audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up security environment
+      uses: ./.github/actions/setup-ci
+      with:
+        python-version: "3.12"
+        dependency-group: ci-security
+    - name: Prepare security evidence directory
+      run: python -c "from pathlib import Path; Path('security-evidence').mkdir(exist_ok=True)"
+    - name: Export locked runtime dependencies
+      run: >
+        uv export --frozen --no-dev --no-emit-project
+        --format requirements-txt
+        --output-file runtime-requirements.txt
+    - name: Export locked optional runtime dependencies
+      run: >
+        uv export --frozen --no-dev --all-extras --no-emit-project
+        --format requirements-txt
+        --output-file all-runtime-requirements.txt
+    - name: Check reviewed runtime dependency licenses
+      run: >
+        python tools/verify_dependency_licenses.py
+        --requirements runtime-requirements.txt
+    - name: Run pip-audit
+      if: ${{ !cancelled() && hashFiles('runtime-requirements.txt') != '' && hashFiles('all-runtime-requirements.txt') != '' }}
+      run: >
+        pip-audit
+        --requirement runtime-requirements.txt
+        --requirement all-runtime-requirements.txt
+        --no-deps
+        --disable-pip
+        --format=json
+        --output security-evidence/security-pip-audit.json
+    - name: Upload dependency audit evidence
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: dependency-audit-evidence
+        path: security-evidence/
+        if-no-files-found: ignore
+
+  workflow_audit:
+    name: GitHub Actions hardening audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Set up security environment
+      uses: ./.github/actions/setup-ci
+      with:
+        python-version: "3.12"
+        dependency-group: ci-security
+    - name: Prepare security evidence directory
+      run: python -c "from pathlib import Path; Path('security-evidence').mkdir(exist_ok=True)"
+    - name: Run zizmor
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: >
+        zizmor
+        --format=github
+        --min-severity=medium
+        --min-confidence=medium
+        .github
+    - name: Collect zizmor JSON evidence
+      if: always()
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: >
+        zizmor
+        --format=json
+        --min-severity=medium
+        --min-confidence=medium
+        .github > security-evidence/security-zizmor.json
+    - name: Upload workflow audit evidence
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: workflow-audit-evidence
+        path: security-evidence/
+        if-no-files-found: ignore
+
+  scorecard:
+    name: OpenSSF Scorecard
+    # Scorecard only supports the repository default branch for branch dispatches.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Run OpenSSF Scorecard
+      uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+      with:
+        results_file: scorecard-results.json
+        results_format: json
+        publish_results: true
+    - name: Run OpenSSF Scorecard SARIF
+      uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+      with:
+        results_file: scorecard-results.sarif
+        results_format: sarif
+        publish_results: false
+    - name: Upload Scorecard results
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: scorecard-results
+        path: |
+          scorecard-results.json
+          scorecard-results.sarif
+        if-no-files-found: error
